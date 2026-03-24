@@ -3,6 +3,7 @@ import streamlit as st
 from datetime import datetime
 from screener.value import fetch_value_data
 from screener.growth import fetch_growth_data
+from screener.options import fetch_options_data
 
 st.set_page_config(page_title="Daily Screener", layout="wide")
 
@@ -87,7 +88,54 @@ with tab_growth:
 
 with tab_options:
     st.subheader("Options")
-    st.info("Options screener coming soon.")
+
+    # Ticker list comes from watchlist; fall back to defaults if no refresh yet
+    _default_tickers = [t for t in DEFAULT_TICKERS.splitlines() if t.strip()]
+    watchlist = st.session_state.get("tickers", _default_tickers)
+
+    col_l, col_r = st.columns([2, 1])
+    with col_l:
+        selected_ticker = st.selectbox("Ticker", watchlist, key="opt_ticker")
+    with col_r:
+        option_type = st.radio("Type", ["Calls", "Puts"], horizontal=True, key="opt_type")
+
+    load_options = st.button("Load Options Chain", key="opt_load")
+
+    if load_options:
+        with st.spinner(f"Fetching options for {selected_ticker}…"):
+            try:
+                result = fetch_options_data(selected_ticker)
+                st.session_state["opt_data"] = result
+                st.session_state["opt_ticker_loaded"] = selected_ticker
+            except Exception as e:
+                st.error(f"Could not load options for {selected_ticker}: {e}")
+                st.session_state.pop("opt_data", None)
+
+    if "opt_data" in st.session_state:
+        data = st.session_state["opt_data"]
+        loaded_for = st.session_state.get("opt_ticker_loaded", "")
+        st.caption(f"Showing options for **{loaded_for}** — current price: **${data['current_price']:.2f}**")
+
+        selected_exp = st.selectbox("Expiration", data["expirations"], key="opt_exp")
+
+        chain_key = "calls" if option_type == "Calls" else "puts"
+        df = data["chains"][selected_exp][chain_key]
+
+        if df.empty:
+            st.info("No contracts found for this selection.")
+        else:
+            flagged = int(df["Flag"].sum())
+            if flagged:
+                st.warning(f"{flagged} contract(s) flagged for unusual activity (Vol/OI > 1.5, near money, volume > 100)")
+
+            def highlight_flag(row):
+                if df.loc[row.name, "Flag"]:
+                    return ["background-color: #4a3800; color: white"] * len(row)
+                return [""] * len(row)
+
+            display_df = df.drop(columns=["Flag"])
+            styled = display_df.style.apply(highlight_flag, axis=1)
+            st.dataframe(styled, use_container_width=True, hide_index=True)
 
 with tab_etfs:
     st.subheader("ETFs")
