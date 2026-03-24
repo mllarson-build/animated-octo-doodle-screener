@@ -1,5 +1,5 @@
 import pandas as pd
-import pandas_ta as ta
+import ta as ta_lib
 import yfinance as yf
 
 
@@ -26,7 +26,7 @@ def fetch_value_data(tickers: list[str]) -> pd.DataFrame:
             low_52w = float(close.min())
             drawdown = (current_price - high_52w) / high_52w * 100  # negative value
 
-            rsi_series = ta.rsi(close, length=14)
+            rsi_series = ta_lib.momentum.rsi(close, window=14)
             rsi = float(rsi_series.iloc[-1]) if rsi_series is not None and not rsi_series.empty else None
 
             volume = hist["Volume"]

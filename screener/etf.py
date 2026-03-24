@@ -1,5 +1,5 @@
 import pandas as pd
-import pandas_ta as ta
+import ta as ta_lib
 import yfinance as yf
 
 ETF_LIST = ["SPY", "QQQ", "IWM", "XLF", "XLK", "XLE", "XLV", "XBI", "GLD", "TLT", "HYG"]
@@ -37,7 +37,7 @@ def fetch_etf_data() -> dict:
             ret_1w = _pct_change(close, 5)
             ret_1m = _pct_change(close, 21)
 
-            rsi_series = ta.rsi(close, length=14)
+            rsi_series = ta_lib.momentum.rsi(close, window=14)
             rsi = float(rsi_series.iloc[-1]) if rsi_series is not None and not rsi_series.empty else None
 
             vol = hist["Volume"]
