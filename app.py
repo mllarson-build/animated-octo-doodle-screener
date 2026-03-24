@@ -4,6 +4,7 @@ from datetime import datetime
 from screener.value import fetch_value_data
 from screener.growth import fetch_growth_data
 from screener.options import fetch_options_data
+from screener.etf import fetch_etf_data
 
 st.set_page_config(page_title="Daily Screener", layout="wide")
 
@@ -25,6 +26,7 @@ with st.sidebar:
             st.session_state["tickers"] = tickers
             st.session_state["value_df"] = fetch_value_data(tickers)
             st.session_state["growth_df"] = fetch_growth_data(tickers)
+            st.session_state["etf_data"] = fetch_etf_data()
             st.session_state["last_refreshed"] = datetime.now().strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
@@ -139,4 +141,52 @@ with tab_options:
 
 with tab_etfs:
     st.subheader("ETFs")
-    st.info("ETF screener coming soon.")
+    if "etf_data" not in st.session_state:
+        st.info("Press **Refresh Data** in the sidebar to load ETF data.")
+    else:
+        etf_df = st.session_state["etf_data"]["etf_df"]
+        macro = st.session_state["etf_data"]["macro"]
+
+        # --- ETF table ---
+        ret_cols = ["1D %", "1W %", "1M %"]
+
+        def color_return(val):
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                return ""
+            if val > 0:
+                return "background-color: #1a7a1a; color: white"
+            if val < 0:
+                return "background-color: #7a1a1a; color: white"
+            return ""
+
+        styled = etf_df.style.applymap(color_return, subset=ret_cols)
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # --- Macro panel ---
+        st.subheader("Macro Indicators")
+        mcol1, mcol2 = st.columns(2)
+
+        vix = macro["vix"]
+        vix_chg = macro["vix_1w_chg"]
+        tnx = macro["tnx"]
+        tnx_chg = macro["tnx_1w_chg"]
+
+        mcol1.metric(
+            "VIX",
+            f"{vix:.2f}" if vix is not None else "N/A",
+            delta=f"{vix_chg:+.2f}% (1W)" if vix_chg is not None else None,
+            delta_color="inverse",  # rising VIX is bad
+        )
+        mcol2.metric(
+            "10Y Treasury Yield",
+            f"{tnx:.2f}%" if tnx is not None else "N/A",
+            delta=f"{tnx_chg:+.2f}% (1W)" if tnx_chg is not None else None,
+        )
+
+        if vix is not None:
+            if vix > 25:
+                st.warning("Elevated volatility — favor defensive positioning")
+            elif vix < 15:
+                st.success("Low volatility environment")
