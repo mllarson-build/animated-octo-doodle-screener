@@ -2,7 +2,7 @@ streamlit
 yfinance
 pandas
 numpy
-pandas-ta
+pandas-ta-classic
 plotly
 requests
 python-dotenv
