@@ -1,6 +1,8 @@
+import pandas as pd
 import streamlit as st
 from datetime import datetime
 from screener.value import fetch_value_data
+from screener.growth import fetch_growth_data
 
 st.set_page_config(page_title="Daily Screener", layout="wide")
 
@@ -21,6 +23,7 @@ with st.sidebar:
         with st.spinner(f"Loading data for {len(tickers)} tickers…"):
             st.session_state["tickers"] = tickers
             st.session_state["value_df"] = fetch_value_data(tickers)
+            st.session_state["growth_df"] = fetch_growth_data(tickers)
             st.session_state["last_refreshed"] = datetime.now().strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
@@ -58,7 +61,29 @@ with tab_value:
 
 with tab_growth:
     st.subheader("Growth Momentum")
-    st.info("Growth Momentum screener coming soon.")
+    if "growth_df" not in st.session_state:
+        st.info("Press **Refresh Data** in the sidebar to run the screener.")
+    else:
+        df = st.session_state["growth_df"]
+        total = len(df)
+        high_conviction = int((df["growth_score"] >= 3).sum())
+        col1, col2 = st.columns(2)
+        col1.metric("Tickers Screened", total)
+        col2.metric("Scored 3+", high_conviction)
+
+        def color_upside(val):
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                return ""
+            if val > 25:
+                return "background-color: #1a7a1a; color: white"
+            elif val >= 10:
+                return "background-color: #7a7a00; color: white"
+            elif val < 0:
+                return "background-color: #7a1a1a; color: white"
+            return ""
+
+        styled = df.style.applymap(color_upside, subset=["Upside %"])
+        st.dataframe(styled, use_container_width=True, hide_index=True)
 
 with tab_options:
     st.subheader("Options")
