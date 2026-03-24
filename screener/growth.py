@@ -1,5 +1,7 @@
 import pandas as pd
 import yfinance as yf
+import streamlit as st
+from screener.utils import load_metadata_cache, save_metadata_cache
 
 
 def _safe_get(info: dict, key: str):
@@ -13,7 +15,6 @@ def _revenue_growth(t: yf.Ticker) -> float | None:
         fin = t.financials  # columns are dates, rows are line items
         if fin is None or fin.empty:
             return None
-        # Look for total revenue row (label varies slightly)
         rev_row = None
         for label in ["Total Revenue", "TotalRevenue", "Revenue"]:
             if label in fin.index:
@@ -52,15 +53,16 @@ def _earnings_growth(t: yf.Ticker) -> float | None:
         return None
 
 
+@st.cache_data(ttl=4 * 3600)
 def fetch_growth_data(tickers: list[str]) -> pd.DataFrame:
     rows = []
+    metadata_cache = load_metadata_cache()
 
     for ticker in tickers:
         try:
             t = yf.Ticker(ticker)
             info = t.info
 
-            # Current price from history (more reliable than info["currentPrice"])
             hist = t.history(period="1y")
             if hist.empty:
                 raise ValueError("No price history")
@@ -69,14 +71,17 @@ def fetch_growth_data(tickers: list[str]) -> pd.DataFrame:
 
             # 3-month momentum: 63 trading days
             if len(close) >= 63:
-                momentum_pct = (current_price - float(close.iloc[-63])) / float(close.iloc[-63]) * 100
+                momentum_pct = (
+                    (current_price - float(close.iloc[-63])) / float(close.iloc[-63]) * 100
+                )
             else:
-                momentum_pct = (current_price - float(close.iloc[0])) / float(close.iloc[0]) * 100
+                momentum_pct = (
+                    (current_price - float(close.iloc[0])) / float(close.iloc[0]) * 100
+                )
 
             rev_growth = _revenue_growth(t)
             earn_growth = _earnings_growth(t)
 
-            # Analyst target
             target_mean = _safe_get(info, "targetMeanPrice")
             upside_pct = (
                 (target_mean - current_price) / current_price * 100
@@ -84,7 +89,6 @@ def fetch_growth_data(tickers: list[str]) -> pd.DataFrame:
                 else None
             )
 
-            # Short interest as % of float
             shares_short = _safe_get(info, "sharesShort")
             float_shares = _safe_get(info, "floatShares")
             short_pct = (
@@ -93,16 +97,28 @@ def fetch_growth_data(tickers: list[str]) -> pd.DataFrame:
                 else None
             )
 
+            # Sector/industry — prefer live data, fall back to disk cache
+            sector = info.get("sector") or None
+            industry = info.get("industry") or None
+            if sector or industry:
+                metadata_cache[ticker] = {"sector": sector, "industry": industry}
+            elif ticker in metadata_cache:
+                cached = metadata_cache[ticker]
+                sector = cached.get("sector")
+                industry = cached.get("industry")
+
             score = sum([
                 rev_growth is not None and rev_growth > 15,
                 earn_growth is not None and earn_growth > 10,
                 upside_pct is not None and upside_pct > 20,
-                short_pct is None or short_pct < 10,  # unknown → benefit of the doubt
+                short_pct is None or short_pct < 10,
                 momentum_pct > 0,
             ])
 
             rows.append({
                 "Ticker": ticker,
+                "Sector": sector,
+                "Industry": industry,
                 "Price": round(current_price, 2),
                 "Rev Growth %": round(rev_growth, 1) if rev_growth is not None else None,
                 "Earn Growth %": round(earn_growth, 1) if earn_growth is not None else None,
@@ -113,9 +129,11 @@ def fetch_growth_data(tickers: list[str]) -> pd.DataFrame:
                 "growth_score": score,
             })
 
-        except Exception as e:
+        except Exception:
             rows.append({
                 "Ticker": ticker,
+                "Sector": None,
+                "Industry": None,
                 "Price": None,
                 "Rev Growth %": None,
                 "Earn Growth %": None,
@@ -124,10 +142,9 @@ def fetch_growth_data(tickers: list[str]) -> pd.DataFrame:
                 "Short % Float": None,
                 "3M Momentum %": None,
                 "growth_score": 0,
-                "_error": str(e),
             })
 
+    save_metadata_cache(metadata_cache)
+
     df = pd.DataFrame(rows)
-    if "_error" in df.columns:
-        df = df.drop(columns=["_error"])
     return df.sort_values("growth_score", ascending=False).reset_index(drop=True)
