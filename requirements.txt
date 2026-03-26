@@ -1,8 +1,8 @@
-streamlit
-yfinance
-pandas
-numpy
-ta
-plotly
-requests
-python-dotenv
+streamlit>=1.44.0
+yfinance>=0.2.60
+pandas>=2.0.0
+numpy>=1.24.0
+ta>=0.11.0
+plotly>=5.0.0
+requests>=2.28.0
+python-dotenv>=1.0.0
