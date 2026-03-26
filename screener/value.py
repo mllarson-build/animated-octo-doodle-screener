@@ -2,7 +2,14 @@ import pandas as pd
 import ta as ta_lib
 import yfinance as yf
 import streamlit as st
-from screener.utils import load_metadata_cache, save_metadata_cache
+from screener.utils import (
+    load_metadata_cache,
+    save_metadata_cache,
+    get_ticker_info,
+    batch_fetch,
+    file_cache_save,
+    file_cache_load,
+)
 
 
 def _safe_get(info: dict, key: str):
@@ -12,23 +19,42 @@ def _safe_get(info: dict, key: str):
 
 @st.cache_data(ttl=4 * 3600)
 def fetch_value_data(tickers: list[str]) -> pd.DataFrame:
-    rows = []
     metadata_cache = load_metadata_cache()
 
-    for ticker in tickers:
+    def fetch_one(ticker: str) -> dict:
+        null_row = {
+            "Ticker": ticker,
+            "Sector": None,
+            "Industry": None,
+            "Price": None,
+            "52W High": None,
+            "52W Low": None,
+            "Drawdown %": None,
+            "52W Return %": None,
+            "RSI (14)": None,
+            "Trailing P/E": None,
+            "Forward P/E": None,
+            "P/B": None,
+            "PEG": None,
+            "Div Yield %": None,
+            "D/E": None,
+            "Avg Vol (30d)": None,
+            "Current Vol": None,
+            "Vol Ratio": None,
+            "recovery_score": 0,
+        }
         try:
+            info = get_ticker_info(ticker)
             t = yf.Ticker(ticker)
-            info = t.info
-
             hist = t.history(period="1y")
             if hist.empty:
-                raise ValueError("No price history")
+                return null_row
 
             close = hist["Close"]
             current_price = float(close.iloc[-1])
             high_52w = float(close.max())
             low_52w = float(close.min())
-            drawdown = (current_price - high_52w) / high_52w * 100  # negative value
+            drawdown = (current_price - high_52w) / high_52w * 100
             return_52w = (current_price - float(close.iloc[0])) / float(close.iloc[0]) * 100
 
             rsi_series = ta_lib.momentum.rsi(close, window=14)
@@ -55,7 +81,6 @@ def fetch_value_data(tickers: list[str]) -> pd.DataFrame:
             div_yield = float(div_yield_raw) * 100 if div_yield_raw is not None else None
             debt_equity = _safe_get(info, "debtToEquity")
 
-            # Sector/industry — prefer live data, fall back to disk cache
             sector = info.get("sector") or None
             industry = info.get("industry") or None
             if sector or industry:
@@ -65,7 +90,6 @@ def fetch_value_data(tickers: list[str]) -> pd.DataFrame:
                 sector = cached.get("sector")
                 industry = cached.get("industry")
 
-            # Recovery score 0-7
             score = sum([
                 abs(drawdown) > 20,
                 rsi is not None and rsi < 40,
@@ -76,7 +100,7 @@ def fetch_value_data(tickers: list[str]) -> pd.DataFrame:
                 div_yield is not None and div_yield > 0,
             ])
 
-            rows.append({
+            return {
                 "Ticker": ticker,
                 "Sector": sector,
                 "Industry": industry,
@@ -96,37 +120,29 @@ def fetch_value_data(tickers: list[str]) -> pd.DataFrame:
                 "Current Vol": current_vol,
                 "Vol Ratio": round(volume_ratio, 2) if volume_ratio is not None else None,
                 "recovery_score": score,
-            })
-
+            }
         except Exception:
-            rows.append({
-                "Ticker": ticker,
-                "Sector": None,
-                "Industry": None,
-                "Price": None,
-                "52W High": None,
-                "52W Low": None,
-                "Drawdown %": None,
-                "52W Return %": None,
-                "RSI (14)": None,
-                "Trailing P/E": None,
-                "Forward P/E": None,
-                "P/B": None,
-                "PEG": None,
-                "Div Yield %": None,
-                "D/E": None,
-                "Avg Vol (30d)": None,
-                "Current Vol": None,
-                "Vol Ratio": None,
-                "recovery_score": 0,
-            })
+            return null_row
 
+    rows = batch_fetch(tickers, fetch_one)
     save_metadata_cache(metadata_cache)
+
+    if not rows:
+        cached_df, ts = file_cache_load("value_data")
+        if cached_df is not None:
+            st.warning(
+                f"Showing cached value data from {ts} — live fetch temporarily unavailable."
+            )
+            return cached_df
+        return pd.DataFrame()
 
     df = pd.DataFrame(rows)
     if "recovery_score" not in df.columns:
         df["recovery_score"] = 0
     try:
-        return df.sort_values("recovery_score", ascending=False).reset_index(drop=True)
+        df = df.sort_values("recovery_score", ascending=False).reset_index(drop=True)
     except Exception:
-        return df.reset_index(drop=True)
+        df = df.reset_index(drop=True)
+
+    file_cache_save("value_data", df)
+    return df

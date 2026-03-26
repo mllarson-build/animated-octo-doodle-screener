@@ -1,7 +1,9 @@
 import pandas as pd
 import yfinance as yf
+import streamlit as st
 
 
+@st.cache_data(ttl=4 * 3600)
 def fetch_options_data(ticker: str) -> dict:
     """
     Returns a dict with:

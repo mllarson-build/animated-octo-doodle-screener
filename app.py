@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 import pandas as pd
 import streamlit as st
 from datetime import datetime
@@ -161,14 +164,15 @@ with st.sidebar:
             tickers = [t.strip().upper() for t in ticker_input.splitlines() if t.strip()]
             st.session_state.pop("ticker_source", None)
 
-        with st.spinner(f"Screening {len(tickers)} tickers…"):
-            st.session_state["tickers"] = tickers
-            st.session_state["value_df"] = fetch_value_data(tickers)
-            st.session_state["growth_df"] = fetch_growth_data(tickers)
-            st.session_state["etf_data"] = fetch_etf_data()
-            st.session_state["last_refreshed"] = datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+        st.session_state["tickers"] = tickers
+        st.session_state["last_refreshed"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Clear tab data so each tab loads its own data lazily
+        for _key in ("value_df", "growth_df", "etf_data"):
+            st.session_state.pop(_key, None)
+        st.success(
+            f"Tickers updated ({len(tickers)} tickers). "
+            "Click **Load Data** inside each tab to fetch screener results."
+        )
 
     if "last_refreshed" in st.session_state:
         st.caption(f"Last refreshed: {st.session_state['last_refreshed']}")
@@ -385,8 +389,16 @@ tab_value, tab_growth, tab_options, tab_etfs = st.tabs(
 # ── Value Recovery ──────────────────────────────────────────────────────────
 with tab_value:
     st.subheader("Value Recovery")
+    _val_tickers = st.session_state.get("tickers", [t.strip() for t in DEFAULT_TICKERS.splitlines() if t.strip()])
+    if st.button(f"Load Value Data ({len(_val_tickers)} tickers)", key="btn_load_value"):
+        with st.spinner(f"Screening {len(_val_tickers)} tickers…"):
+            st.session_state["value_df"] = fetch_value_data(_val_tickers)
+
     if "value_df" not in st.session_state:
-        st.info("Press **Refresh Data** in the sidebar to run the screener.")
+        st.info(
+            "Click **Load Value Data** above to fetch screener results. "
+            "Use **Refresh Data** in the sidebar to change the ticker universe first."
+        )
     else:
         raw_df = st.session_state["value_df"]
 
@@ -419,8 +431,16 @@ with tab_value:
 # ── Growth Momentum ──────────────────────────────────────────────────────────
 with tab_growth:
     st.subheader("Growth Momentum")
+    _grw_tickers = st.session_state.get("tickers", [t.strip() for t in DEFAULT_TICKERS.splitlines() if t.strip()])
+    if st.button(f"Load Growth Data ({len(_grw_tickers)} tickers)", key="btn_load_growth"):
+        with st.spinner(f"Screening {len(_grw_tickers)} tickers…"):
+            st.session_state["growth_df"] = fetch_growth_data(_grw_tickers)
+
     if "growth_df" not in st.session_state:
-        st.info("Press **Refresh Data** in the sidebar to run the screener.")
+        st.info(
+            "Click **Load Growth Data** above to fetch screener results. "
+            "Use **Refresh Data** in the sidebar to change the ticker universe first."
+        )
     else:
         raw_df = st.session_state["growth_df"]
 
@@ -513,8 +533,12 @@ with tab_options:
 # ── ETFs ─────────────────────────────────────────────────────────────────────
 with tab_etfs:
     st.subheader("ETFs")
+    if st.button("Load ETF Data", key="btn_load_etf"):
+        with st.spinner("Fetching ETF and macro data…"):
+            st.session_state["etf_data"] = fetch_etf_data()
+
     if "etf_data" not in st.session_state:
-        st.info("Press **Refresh Data** in the sidebar to load ETF data.")
+        st.info("Click **Load ETF Data** above to fetch ETF performance and macro indicators.")
     else:
         etf_df = st.session_state["etf_data"]["etf_df"]
         macro = st.session_state["etf_data"]["macro"]

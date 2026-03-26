@@ -1,7 +1,15 @@
 import pandas as pd
 import yfinance as yf
 import streamlit as st
-from screener.utils import load_metadata_cache, save_metadata_cache
+from screener.utils import (
+    load_metadata_cache,
+    save_metadata_cache,
+    get_ticker_info,
+    get_ticker_financials,
+    batch_fetch,
+    file_cache_save,
+    file_cache_load,
+)
 
 
 def _safe_get(info: dict, key: str):
@@ -9,10 +17,9 @@ def _safe_get(info: dict, key: str):
     return val if val not in (None, "N/A", "Infinity", float("inf")) else None
 
 
-def _revenue_growth(t: yf.Ticker) -> float | None:
+def _revenue_growth(fin: pd.DataFrame) -> float | None:
     """YoY revenue growth from annual financials (most recent vs prior year)."""
     try:
-        fin = t.financials  # columns are dates, rows are line items
         if fin is None or fin.empty:
             return None
         rev_row = None
@@ -31,10 +38,9 @@ def _revenue_growth(t: yf.Ticker) -> float | None:
         return None
 
 
-def _earnings_growth(t: yf.Ticker) -> float | None:
+def _earnings_growth(fin: pd.DataFrame) -> float | None:
     """YoY net income growth from annual financials."""
     try:
-        fin = t.financials
         if fin is None or fin.empty:
             return None
         ni_row = None
@@ -55,21 +61,33 @@ def _earnings_growth(t: yf.Ticker) -> float | None:
 
 @st.cache_data(ttl=4 * 3600)
 def fetch_growth_data(tickers: list[str]) -> pd.DataFrame:
-    rows = []
     metadata_cache = load_metadata_cache()
 
-    for ticker in tickers:
+    def fetch_one(ticker: str) -> dict:
+        null_row = {
+            "Ticker": ticker,
+            "Sector": None,
+            "Industry": None,
+            "Price": None,
+            "Rev Growth %": None,
+            "Earn Growth %": None,
+            "Analyst Target": None,
+            "Upside %": None,
+            "Short % Float": None,
+            "3M Momentum %": None,
+            "growth_score": 0,
+        }
         try:
+            info = get_ticker_info(ticker)
+            fin = get_ticker_financials(ticker)
             t = yf.Ticker(ticker)
-            info = t.info
 
             hist = t.history(period="1y")
             if hist.empty:
-                raise ValueError("No price history")
+                return null_row
             close = hist["Close"]
             current_price = float(close.iloc[-1])
 
-            # 3-month momentum: 63 trading days
             if len(close) >= 63:
                 momentum_pct = (
                     (current_price - float(close.iloc[-63])) / float(close.iloc[-63]) * 100
@@ -79,8 +97,8 @@ def fetch_growth_data(tickers: list[str]) -> pd.DataFrame:
                     (current_price - float(close.iloc[0])) / float(close.iloc[0]) * 100
                 )
 
-            rev_growth = _revenue_growth(t)
-            earn_growth = _earnings_growth(t)
+            rev_growth = _revenue_growth(fin)
+            earn_growth = _earnings_growth(fin)
 
             target_mean = _safe_get(info, "targetMeanPrice")
             upside_pct = (
@@ -97,7 +115,6 @@ def fetch_growth_data(tickers: list[str]) -> pd.DataFrame:
                 else None
             )
 
-            # Sector/industry — prefer live data, fall back to disk cache
             sector = info.get("sector") or None
             industry = info.get("industry") or None
             if sector or industry:
@@ -115,7 +132,7 @@ def fetch_growth_data(tickers: list[str]) -> pd.DataFrame:
                 momentum_pct > 0,
             ])
 
-            rows.append({
+            return {
                 "Ticker": ticker,
                 "Sector": sector,
                 "Industry": industry,
@@ -127,24 +144,29 @@ def fetch_growth_data(tickers: list[str]) -> pd.DataFrame:
                 "Short % Float": round(short_pct, 1) if short_pct is not None else None,
                 "3M Momentum %": round(momentum_pct, 1),
                 "growth_score": score,
-            })
-
+            }
         except Exception:
-            rows.append({
-                "Ticker": ticker,
-                "Sector": None,
-                "Industry": None,
-                "Price": None,
-                "Rev Growth %": None,
-                "Earn Growth %": None,
-                "Analyst Target": None,
-                "Upside %": None,
-                "Short % Float": None,
-                "3M Momentum %": None,
-                "growth_score": 0,
-            })
+            return null_row
 
+    rows = batch_fetch(tickers, fetch_one)
     save_metadata_cache(metadata_cache)
 
+    if not rows:
+        cached_df, ts = file_cache_load("growth_data")
+        if cached_df is not None:
+            st.warning(
+                f"Showing cached growth data from {ts} — live fetch temporarily unavailable."
+            )
+            return cached_df
+        return pd.DataFrame()
+
     df = pd.DataFrame(rows)
-    return df.sort_values("growth_score", ascending=False).reset_index(drop=True)
+    if "growth_score" not in df.columns:
+        df["growth_score"] = 0
+    try:
+        df = df.sort_values("growth_score", ascending=False).reset_index(drop=True)
+    except Exception:
+        df = df.reset_index(drop=True)
+
+    file_cache_save("growth_data", df)
+    return df
