@@ -12,6 +12,12 @@ from screener.etf import fetch_etf_data
 from screener.tickers import get_filtered_universe
 from screener.utils import fmt_volume
 from screener.trade import analyze_trade, save_trade_idea, load_trade_log, save_trade_log
+from screener.backtest import (
+    run_backtest,
+    HOLDING_PERIOD_DAYS,
+    LOOKBACK_PERIODS,
+    SIGNAL_DESCRIPTIONS,
+)
 
 st.set_page_config(page_title="Daily Screener", layout="wide")
 
@@ -383,8 +389,8 @@ ETF_COLUMN_CONFIG = {
 # ---------------------------------------------------------------------------
 # Main tabs
 # ---------------------------------------------------------------------------
-tab_value, tab_growth, tab_options, tab_etfs, tab_trade = st.tabs(
-    ["Value Recovery", "Growth Momentum", "Options", "ETFs", "Trade Builder"]
+tab_value, tab_growth, tab_options, tab_etfs, tab_trade, tab_backtest = st.tabs(
+    ["Value Recovery", "Growth Momentum", "Options", "ETFs", "Trade Builder", "Backtest"]
 )
 
 # ── Value Recovery ──────────────────────────────────────────────────────────
@@ -874,3 +880,273 @@ with tab_trade:
             if st.button("Save Changes", key="tb_log_save"):
                 save_trade_log(_edited)
                 st.success("Trade log updated.")
+
+# ── Backtest ──────────────────────────────────────────────────────────────────
+with tab_backtest:
+    import plotly.graph_objects as go
+    import plotly.express as px
+
+    st.subheader("Signal Backtester")
+    st.warning(
+        "**Disclaimer:** Backtests use historical price data and do not account for "
+        "slippage, commissions, taxes, or survivorship bias (delisted stocks are not "
+        "included unless you add them manually). Past performance does not guarantee "
+        "future results. Results are for research purposes only."
+    )
+
+    # ── Inputs ────────────────────────────────────────────────────────────────
+    _bt_c1, _bt_c2 = st.columns([2, 2])
+
+    with _bt_c1:
+        _bt_raw = st.text_area(
+            "Tickers to test (one per line)",
+            value="AAPL\nMSFT\nJPM\nXOM\nNVDA",
+            height=140,
+            key="bt_tickers",
+        )
+        _bt_tickers = [t.strip().upper() for t in _bt_raw.splitlines() if t.strip()]
+
+        _bt_signal = st.selectbox(
+            "Signal to test",
+            list(SIGNAL_DESCRIPTIONS.keys()),
+            key="bt_signal",
+        )
+        st.caption(f"*{SIGNAL_DESCRIPTIONS[_bt_signal]}*")
+
+    with _bt_c2:
+        _bt_holding_label = st.selectbox(
+            "Holding period after signal",
+            list(HOLDING_PERIOD_DAYS.keys()),
+            index=1,
+            key="bt_holding",
+        )
+        _bt_holding_days = HOLDING_PERIOD_DAYS[_bt_holding_label]
+
+        _bt_lookback_label = st.selectbox(
+            "Lookback period",
+            list(LOOKBACK_PERIODS.keys()),
+            index=1,
+            key="bt_lookback",
+        )
+        _bt_period = LOOKBACK_PERIODS[_bt_lookback_label]
+
+        _bt_custom_rsi = 35.0
+        _bt_custom_dd  = 20.0
+        if _bt_signal in ("RSI Oversold", "Custom"):
+            _bt_custom_rsi = float(st.slider(
+                "RSI threshold (signal fires when RSI < X)", 20, 60, 35, key="bt_rsi"
+            ))
+        if _bt_signal in ("Value Recovery", "Custom"):
+            _bt_custom_dd = float(st.slider(
+                "Drawdown threshold % (signal fires when drawdown > X%)", 5, 50, 20, key="bt_dd"
+            ))
+
+    _bt_run = st.button("Run Backtest", type="primary", key="bt_run")
+
+    if _bt_run:
+        if not _bt_tickers:
+            st.error("Enter at least one ticker.")
+        else:
+            with st.spinner(
+                f"Fetching {_bt_lookback_label} of data for "
+                f"{len(_bt_tickers)} ticker(s) and scanning for signals…"
+            ):
+                _bt_result = run_backtest(
+                    tickers=_bt_tickers,
+                    signal_type=_bt_signal,
+                    holding_days=_bt_holding_days,
+                    period=_bt_period,
+                    custom_rsi=_bt_custom_rsi,
+                    custom_drawdown=_bt_custom_dd,
+                )
+            st.session_state["bt_result"] = _bt_result
+            st.session_state["bt_params"] = {
+                "signal": _bt_signal,
+                "holding": _bt_holding_label,
+                "lookback": _bt_lookback_label,
+                "tickers": _bt_tickers,
+            }
+
+    if "bt_result" not in st.session_state:
+        st.info("Configure inputs above and click **Run Backtest**.")
+    else:
+        _bt_result = st.session_state["bt_result"]
+        _bt_params = st.session_state.get("bt_params", {})
+
+        if "error" in _bt_result:
+            st.error(_bt_result["error"])
+        else:
+            _trades_df = _bt_result["trades"]
+            _metrics   = _bt_result["metrics"]
+            _spy_series = _bt_result["spy_series"]
+
+            st.caption(
+                f"Signal: **{_bt_params.get('signal','')}** | "
+                f"Hold: **{_bt_params.get('holding','')}** | "
+                f"Lookback: **{_bt_params.get('lookback','')}** | "
+                f"Tickers: {', '.join(_bt_params.get('tickers',[]))}"
+            )
+            st.divider()
+
+            # ── Summary metrics ───────────────────────────────────────────────
+            st.markdown("**Performance Summary**")
+            _sm1, _sm2, _sm3, _sm4 = st.columns(4)
+            _sm1.metric("Total Signals", _metrics["total_signals"])
+            _sm2.metric(
+                "Win Rate",
+                f"{_metrics['win_rate']:.1f}%",
+                delta="Good" if _metrics["win_rate"] >= 55 else "Below 55%",
+                delta_color="normal" if _metrics["win_rate"] >= 55 else "inverse",
+            )
+            _sm3.metric(
+                "Avg Return / Signal",
+                f"{_metrics['avg_return']:+.2f}%",
+                delta_color="normal" if _metrics["avg_return"] > 0 else "inverse",
+            )
+            _sm4.metric(
+                "vs SPY Buy & Hold",
+                f"{_metrics['spy_return']:+.1f}%" if _metrics["spy_return"] is not None else "N/A",
+                delta=(
+                    f"Strategy avg {_metrics['avg_return']:+.2f}%"
+                    if _metrics["spy_return"] is not None else None
+                ),
+                delta_color="off",
+            )
+
+            _sm5, _sm6, _sm7, _sm8 = st.columns(4)
+            _sm5.metric("Median Return", f"{_metrics['median_return']:+.2f}%")
+            _sm6.metric(
+                "Profit Factor",
+                f"{_metrics['profit_factor']:.2f}" if _metrics["profit_factor"] else "N/A",
+                help="Gross wins / gross losses. Above 1.0 is profitable overall.",
+            )
+            _sm7.metric(
+                "Sharpe-like Ratio",
+                f"{_metrics['sharpe_like']:.3f}" if _metrics["sharpe_like"] is not None else "N/A",
+                help="Mean return ÷ std deviation of returns. Higher is better.",
+            )
+            _sm8.metric("Max Consec. Losses", _metrics["max_consec_losses"])
+
+            _sm9, _sm10, _sm11, _sm12 = st.columns(4)
+            _sm9.metric("Best Trade",  f"{_metrics['best_trade']:+.2f}%")
+            _sm10.metric("Worst Trade", f"{_metrics['worst_trade']:+.2f}%")
+            _sm11.metric("Avg Win",  f"{_metrics['avg_win']:+.2f}%")
+            _sm12.metric("Avg Loss", f"{_metrics['avg_loss']:+.2f}%")
+
+            st.divider()
+
+            # ── Charts ────────────────────────────────────────────────────────
+            _chart_c1, _chart_c2 = st.columns([1, 1])
+
+            with _chart_c1:
+                st.markdown("**Return Distribution**")
+                _fig_hist = px.histogram(
+                    _trades_df,
+                    x="Return %",
+                    nbins=max(10, min(50, len(_trades_df) // 2)),
+                    color_discrete_sequence=["#4a9eff"],
+                    labels={"Return %": "Return per Trade (%)"},
+                )
+                _fig_hist.add_vline(
+                    x=0,
+                    line_dash="solid",
+                    line_color="red",
+                    annotation_text="0%",
+                    annotation_position="top right",
+                )
+                _fig_hist.add_vline(
+                    x=_metrics["avg_return"],
+                    line_dash="dash",
+                    line_color="orange",
+                    annotation_text=f"Avg {_metrics['avg_return']:+.1f}%",
+                    annotation_position="top left",
+                )
+                _fig_hist.add_vline(
+                    x=_metrics["median_return"],
+                    line_dash="dot",
+                    line_color="yellow",
+                    annotation_text=f"Med {_metrics['median_return']:+.1f}%",
+                    annotation_position="bottom right",
+                )
+                _fig_hist.update_layout(
+                    paper_bgcolor="#0e1117",
+                    plot_bgcolor="#1a1f2e",
+                    font_color="#fafafa",
+                    margin=dict(l=10, r=10, t=30, b=10),
+                    showlegend=False,
+                )
+                st.plotly_chart(_fig_hist, use_container_width=True)
+
+            with _chart_c2:
+                st.markdown("**Cumulative Return: Strategy vs SPY Buy & Hold**")
+                _fig_cum = go.Figure()
+
+                # Strategy equity curve
+                _fig_cum.add_trace(go.Scatter(
+                    x=_metrics["cum_dates"],
+                    y=_metrics["cum_equity"],
+                    mode="lines+markers",
+                    name="Strategy (sequential trades)",
+                    line=dict(color="#4a9eff", width=2),
+                    marker=dict(size=4),
+                ))
+
+                # SPY normalized line
+                if not _spy_series.empty:
+                    _fig_cum.add_trace(go.Scatter(
+                        x=_spy_series.index,
+                        y=_spy_series.values,
+                        mode="lines",
+                        name="SPY Buy & Hold",
+                        line=dict(color="#ff9944", width=1.5, dash="dash"),
+                    ))
+
+                _fig_cum.add_hline(
+                    y=100,
+                    line_dash="dot",
+                    line_color="gray",
+                    annotation_text="Starting capital",
+                )
+                _fig_cum.update_layout(
+                    paper_bgcolor="#0e1117",
+                    plot_bgcolor="#1a1f2e",
+                    font_color="#fafafa",
+                    yaxis_title="Equity (start = 100)",
+                    xaxis_title="Date",
+                    legend=dict(bgcolor="rgba(0,0,0,0)"),
+                    margin=dict(l=10, r=10, t=30, b=10),
+                )
+                st.plotly_chart(_fig_cum, use_container_width=True)
+
+            st.divider()
+
+            # ── Trade table ───────────────────────────────────────────────────
+            st.markdown("**All Signal Occurrences**")
+            _display_trades = _trades_df.copy()
+            _display_trades["Win/Loss"] = _display_trades["Win"].map(
+                {True: "Win", False: "Loss"}
+            )
+            _display_trades = _display_trades.drop(columns=["Win"])
+
+            def _color_return(val):
+                if isinstance(val, (int, float)):
+                    return "color: #4caf50" if val > 0 else "color: #f44336"
+                return ""
+
+            _styled_trades = _display_trades.style.applymap(
+                _color_return, subset=["Return %"]
+            )
+            st.dataframe(
+                _styled_trades,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Ticker":       st.column_config.TextColumn("Ticker"),
+                    "Entry Date":   st.column_config.TextColumn("Entry Date"),
+                    "Exit Date":    st.column_config.TextColumn("Exit Date"),
+                    "Entry Price":  st.column_config.NumberColumn("Entry", format="$%.2f"),
+                    "Exit Price":   st.column_config.NumberColumn("Exit",  format="$%.2f"),
+                    "Return %":     st.column_config.NumberColumn("Return %", format="%+.2f%%"),
+                    "Win/Loss":     st.column_config.TextColumn("Result"),
+                },
+            )
