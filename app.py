@@ -11,6 +11,7 @@ from screener.options import fetch_options_data
 from screener.etf import fetch_etf_data
 from screener.tickers import get_filtered_universe
 from screener.utils import fmt_volume
+from screener.trade import analyze_trade, save_trade_idea, load_trade_log, save_trade_log
 
 st.set_page_config(page_title="Daily Screener", layout="wide")
 
@@ -382,8 +383,8 @@ ETF_COLUMN_CONFIG = {
 # ---------------------------------------------------------------------------
 # Main tabs
 # ---------------------------------------------------------------------------
-tab_value, tab_growth, tab_options, tab_etfs = st.tabs(
-    ["Value Recovery", "Growth Momentum", "Options", "ETFs"]
+tab_value, tab_growth, tab_options, tab_etfs, tab_trade = st.tabs(
+    ["Value Recovery", "Growth Momentum", "Options", "ETFs", "Trade Builder"]
 )
 
 # ── Value Recovery ──────────────────────────────────────────────────────────
@@ -588,3 +589,288 @@ with tab_etfs:
                 st.warning("Elevated volatility — favor defensive positioning")
             elif vix < 15:
                 st.success("Low volatility environment")
+
+# ── Trade Builder ─────────────────────────────────────────────────────────────
+with tab_trade:
+    st.subheader("Trade Builder")
+    st.caption(
+        "Select a ticker to generate a structured trade idea with price levels, "
+        "position sizing, momentum signals, hedge suggestions, and a paper trade log."
+    )
+
+    # Ticker selection — prefer watchlist, allow manual entry
+    _watchlist = st.session_state.get(
+        "tickers", [t.strip() for t in DEFAULT_TICKERS.splitlines() if t.strip()]
+    )
+    _tb_col1, _tb_col2 = st.columns([2, 1])
+    with _tb_col1:
+        _tb_ticker_select = st.selectbox(
+            "Select from watchlist", _watchlist, key="tb_ticker_select"
+        )
+    with _tb_col2:
+        _tb_ticker_manual = st.text_input(
+            "Or enter manually", placeholder="e.g. NVDA", key="tb_ticker_manual"
+        )
+    _tb_ticker = _tb_ticker_manual.strip().upper() if _tb_ticker_manual.strip() else _tb_ticker_select
+
+    _tb_analyze = st.button("Analyze Trade", type="primary", key="tb_analyze")
+
+    if _tb_analyze:
+        with st.spinner(f"Analyzing {_tb_ticker}…"):
+            try:
+                _tc = analyze_trade(_tb_ticker)
+                st.session_state["trade_card"] = _tc
+                st.session_state["trade_ticker"] = _tb_ticker
+            except Exception as _e:
+                st.error(f"Could not analyze {_tb_ticker}: {_e}")
+                st.session_state.pop("trade_card", None)
+
+    if "trade_card" not in st.session_state:
+        st.info("Enter a ticker above and click **Analyze Trade** to generate a trade card.")
+    else:
+        _tc = st.session_state["trade_card"]
+        _sym = _tc["ticker"]
+        _ee = _tc["entry_exit"]
+        _pl = _tc["price_levels"]
+        _mo = _tc["momentum"]
+        _sz = _tc["sizing"]
+        _hg = _tc["hedge"]
+        _fu = _tc["fundamentals"]
+        _score = _tc["setup_score"]
+
+        st.divider()
+
+        # ── Setup quality score & summary ─────────────────────────────────────
+        _score_labels = {5: "Excellent", 4: "Strong", 3: "Moderate", 2: "Weak", 1: "Poor", 0: "Poor"}
+        _score_label = _score_labels.get(_score, "Poor")
+        _score_col, _sum_col = st.columns([1, 4])
+        with _score_col:
+            _score_color = "#1a7a1a" if _score >= 4 else "#7a7a00" if _score >= 2 else "#7a1a1a"
+            st.markdown(
+                f"<div style='background:{_score_color};padding:16px;border-radius:8px;"
+                f"text-align:center'>"
+                f"<div style='color:white;font-size:2rem;font-weight:bold'>{_score}/5</div>"
+                f"<div style='color:white;font-size:0.9rem'>{_score_label} Setup</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with _sum_col:
+            st.markdown(f"**{_sym}** — {_tc['summary']}")
+            if _ee["good_setup"]:
+                st.success("R/R >= 2.0 — qualifies as a good setup")
+            else:
+                st.warning(f"R/R = {_ee['rr']:.1f} — below 2.0 threshold, proceed with caution")
+
+        st.divider()
+
+        # ── Key metrics row ───────────────────────────────────────────────────
+        st.markdown("**Entry / Exit Framework**")
+        _m1, _m2, _m3, _m4, _m5 = st.columns(5)
+        _m1.metric("Current Price", f"${_tc['current_price']:.2f}")
+        _m2.metric(
+            "Entry Zone",
+            f"${_ee['entry']:.2f}",
+            delta=f"to ${_ee['entry_low']:.2f}",
+            delta_color="off",
+        )
+        _m3.metric(
+            "Price Target",
+            f"${_ee['target']:.2f}",
+            delta=f"+{_ee['upside_pct']:.1f}%",
+        )
+        _m4.metric(
+            "Stop Loss",
+            f"${_ee['stop']:.2f}",
+            delta=f"-8.0%",
+            delta_color="inverse",
+        )
+        _m5.metric(
+            "Risk/Reward",
+            f"{_ee['rr']:.1f}:1",
+            delta="Good" if _ee["good_setup"] else "Weak",
+            delta_color="normal" if _ee["good_setup"] else "inverse",
+        )
+        st.caption(f"Target source: {_ee['target_source']}")
+
+        st.divider()
+
+        # ── Price levels ──────────────────────────────────────────────────────
+        st.markdown("**Price Levels**")
+        _lc1, _lc2, _lc3, _lc4, _lc5, _lc6 = st.columns(6)
+        _lc1.metric("52W High", f"${_pl['high_52w']:.2f}", delta=f"{_ee['drawdown_from_high']:.1f}%", delta_color="inverse")
+        _lc2.metric("52W Low", f"${_pl['low_52w']:.2f}")
+        _lc3.metric("20d Resistance", f"${_pl['resistance_20d']:.2f}")
+        _lc4.metric("20d Support", f"${_pl['support_20d']:.2f}")
+        _lc5.metric("50-day MA", f"${_pl['ma_50']:.2f}" if _pl["ma_50"] else "N/A")
+        _lc6.metric("200-day MA", f"${_pl['ma_200']:.2f}" if _pl["ma_200"] else "N/A")
+
+        st.divider()
+
+        # ── Position sizing (portfolio = $8,000) ──────────────────────────────
+        st.markdown("**Position Sizing** — based on $8,000 portfolio")
+        _sz_rows = []
+        for _lbl, _s in _sz.items():
+            _sz_rows.append({
+                "Size": _lbl.capitalize(),
+                "Risk %": f"{_s['risk_pct']:.0f}%",
+                "Shares": _s["shares"],
+                "Total Cost": f"${_s['total_cost']:,.2f}",
+                "Max Loss (at stop)": f"-${_s['max_loss']:,.2f}",
+                "Target Profit": f"+${_s['target_profit']:,.2f}",
+            })
+        st.dataframe(pd.DataFrame(_sz_rows), use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # ── Momentum & timing ─────────────────────────────────────────────────
+        st.markdown("**Momentum & Timing**")
+        _mc1, _mc2, _mc3, _mc4, _mc5 = st.columns(5)
+        _rsi_val = _mo["rsi"]
+        _mc1.metric(
+            "RSI (14)",
+            f"{_rsi_val:.1f}" if _rsi_val is not None else "N/A",
+            delta=_mo["rsi_label"],
+            delta_color="off",
+        )
+        _mc2.metric(
+            "MACD Signal",
+            "Bullish cross" if _mo["macd_bullish_crossover"] else "No cross",
+            delta="Last 5 days",
+            delta_color="off",
+        )
+        _mc3.metric(
+            "vs 50-day MA",
+            "Above" if _mo["above_50ma"] else "Below" if _mo["above_50ma"] is not None else "N/A",
+            delta_color="off",
+        )
+        _mc4.metric(
+            "vs 200-day MA",
+            "Above" if _mo["above_200ma"] else "Below" if _mo["above_200ma"] is not None else "N/A",
+            delta_color="off",
+        )
+        _mc5.metric(
+            "ATR (14d)",
+            f"${_mo['atr']:.2f}" if _mo["atr"] else "N/A",
+            delta=f"{_mo['atr_pct']:.1f}% of price" if _mo["atr_pct"] else None,
+            delta_color="off",
+        )
+        if _mo["macd_bullish_crossover"]:
+            st.success("MACD bullish crossover detected in the last 5 trading days.")
+        if _mo["above_200ma"] is True:
+            st.success("Price is above the 200-day MA — long-term uptrend intact.")
+        elif _mo["above_200ma"] is False:
+            st.warning("Price is below the 200-day MA — caution in longer-term entries.")
+        st.info(f"Suggested holding period: **{_mo['holding_period']}**")
+
+        st.divider()
+
+        # ── Hedge suggestions ─────────────────────────────────────────────────
+        st.markdown("**Hedge Suggestions**")
+        _hc1, _hc2 = st.columns(2)
+
+        with _hc1:
+            st.markdown("**Protective Put**")
+            _pp = _hg["protective_put"]
+            if _pp:
+                st.markdown(
+                    f"Buy **{_pp['num_contracts']} put contract(s)** at "
+                    f"**${_pp['strike']:.2f} strike** expiring **{_pp['expiration']}**"
+                )
+                st.markdown(
+                    f"- Premium: ${_pp['premium_per_share']:.2f}/share "
+                    f"({_pp['cost_pct_of_position']:.1f}% of position)"
+                )
+                st.markdown(f"- Total put cost: **${_pp['total_cost']:,.2f}**")
+                st.markdown(f"- Breakeven (inc. put cost): **${_pp['breakeven_with_put']:.2f}**")
+            elif _sz["moderate"]["total_cost"] <= 500:
+                st.caption("Position < $500 — protective put not warranted.")
+            else:
+                st.caption("No suitable put found near the 5-10% OTM range.")
+
+        with _hc2:
+            st.markdown(f"**Portfolio Hedge — {_hg['hedge_etf_symbol']}** ({_hg['hedge_etf_desc']})")
+            st.markdown(
+                f"A 10% portfolio allocation of **${_hg['hedge_alloc_10pct']:,.2f}** to "
+                f"**{_hg['hedge_etf_symbol']}** provides inverse market exposure to "
+                f"partially offset losses if the broader market sells off."
+            )
+            st.caption(
+                "Inverse ETFs decay over time and are best used as short-term hedges "
+                "during elevated volatility periods."
+            )
+
+        st.divider()
+
+        # ── Fundamental snapshot ──────────────────────────────────────────────
+        st.markdown("**Fundamental Snapshot**")
+        _fc1, _fc2, _fc3 = st.columns(3)
+
+        def _fmt(v, fmt=".2f", suffix=""):
+            return f"{v:{fmt}}{suffix}" if v is not None else "N/A"
+
+        with _fc1:
+            st.markdown(f"**Trailing P/E:** {_fmt(_fu['trailing_pe'])}")
+            st.markdown(f"**Forward P/E:** {_fmt(_fu['forward_pe'])}")
+            st.markdown(f"**PEG Ratio:** {_fmt(_fu['peg'])}")
+            st.markdown(f"**P/B Ratio:** {_fmt(_fu['pb'])}")
+        with _fc2:
+            st.markdown(f"**Div Yield:** {_fmt(_fu['div_yield'], '.2f', '%')}")
+            st.markdown(f"**Debt/Equity:** {_fmt(_fu['debt_equity'])}")
+            st.markdown(f"**Rev Growth (YoY):** {_fmt(_fu['rev_growth'], '.1f', '%')}")
+            st.markdown(f"**Earn Growth (YoY):** {_fmt(_fu['earn_growth'], '.1f', '%')}")
+        with _fc3:
+            st.markdown(f"**Short Interest:** {_fmt(_fu['short_pct'], '.1f', '%')}")
+            _analysts_str = (
+                f"{_fu['num_analysts']} analysts" if _fu["num_analysts"] else "N/A"
+            )
+            st.markdown(f"**Analyst Consensus:** {_fu['rec_label']} ({_analysts_str})")
+            if _fu["rec_mean"] is not None:
+                st.markdown(f"**Rating Mean:** {_fu['rec_mean']:.2f} (1=Strong Buy, 5=Sell)")
+
+        st.divider()
+
+        # ── Save trade idea ───────────────────────────────────────────────────
+        if st.button("Save Trade Idea to Log", key="tb_save"):
+            save_trade_idea(_tc)
+            st.success(f"Trade idea for {_sym} saved to trade log.")
+
+    # ── Trade log ─────────────────────────────────────────────────────────────
+    st.divider()
+    with st.expander("View Trade Log", expanded=False):
+        _log_df = load_trade_log()
+
+        if _log_df.empty:
+            st.info("No trade ideas saved yet. Analyze a ticker and click **Save Trade Idea**.")
+        else:
+            st.caption(
+                "Edit **Actual Entry**, **Actual Exit**, **Outcome Notes**, and **Status** "
+                "inline, then click **Save Changes** to persist."
+            )
+            _edited = st.data_editor(
+                _log_df,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                column_config={
+                    "timestamp": st.column_config.TextColumn("Date", disabled=True),
+                    "ticker": st.column_config.TextColumn("Ticker", disabled=True),
+                    "entry": st.column_config.NumberColumn("Entry", format="$%.2f", disabled=True),
+                    "target": st.column_config.NumberColumn("Target", format="$%.2f", disabled=True),
+                    "stop": st.column_config.NumberColumn("Stop", format="$%.2f", disabled=True),
+                    "rr": st.column_config.NumberColumn("R/R", format="%.1f", disabled=True),
+                    "setup_score": st.column_config.NumberColumn("Score", format="%d", disabled=True),
+                    "upside_pct": st.column_config.NumberColumn("Upside %", format="%.1f%%", disabled=True),
+                    "summary": st.column_config.TextColumn("Summary", disabled=True, width="large"),
+                    "actual_entry": st.column_config.NumberColumn("Actual Entry", format="$%.2f"),
+                    "actual_exit": st.column_config.NumberColumn("Actual Exit", format="$%.2f"),
+                    "outcome_notes": st.column_config.TextColumn("Notes", width="medium"),
+                    "status": st.column_config.SelectboxColumn(
+                        "Status",
+                        options=["Open", "Executed", "Closed — Win", "Closed — Loss", "Cancelled"],
+                    ),
+                },
+                key="trade_log_editor",
+            )
+            if st.button("Save Changes", key="tb_log_save"):
+                save_trade_log(_edited)
+                st.success("Trade log updated.")
