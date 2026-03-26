@@ -124,4 +124,9 @@ def fetch_value_data(tickers: list[str]) -> pd.DataFrame:
     save_metadata_cache(metadata_cache)
 
     df = pd.DataFrame(rows)
-    return df.sort_values("recovery_score", ascending=False).reset_index(drop=True)
+    if "recovery_score" not in df.columns:
+        df["recovery_score"] = 0
+    try:
+        return df.sort_values("recovery_score", ascending=False).reset_index(drop=True)
+    except Exception:
+        return df.reset_index(drop=True)

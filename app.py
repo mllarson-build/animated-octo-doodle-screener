@@ -130,6 +130,10 @@ with st.sidebar:
             "Scans NYSE, NASDAQ & AMEX. Pre-filters to price > $1 and avg daily volume > 500K. "
             "First run may take several minutes."
         )
+        if "tickers" in st.session_state and "ticker_source" in st.session_state:
+            n = len(st.session_state["tickers"])
+            src = st.session_state["ticker_source"]
+            st.info(f"Full universe: {n} tickers loaded from {src}.")
 
     refresh = st.button("Refresh Data", use_container_width=True)
 
@@ -137,14 +141,25 @@ with st.sidebar:
         if use_full_universe:
             status_text = st.empty()
             progress_bar = st.progress(0, text="Starting…")
-            tickers = get_filtered_universe(
+            tickers, ticker_source = get_filtered_universe(
                 progress_bar=progress_bar,
                 status_placeholder=status_text,
             )
             progress_bar.empty()
-            status_text.text(f"Universe filtered to {len(tickers)} liquid tickers.")
+            if len(tickers) == 0:
+                status_text.warning(
+                    f"Universe filtered to 0 liquid tickers (source: {ticker_source}). "
+                    "The pre-filter may be too strict or data could not be fetched. "
+                    "Try refreshing or switching to manual ticker mode."
+                )
+            else:
+                status_text.text(
+                    f"Universe filtered to {len(tickers)} liquid tickers (source: {ticker_source})."
+                )
+            st.session_state["ticker_source"] = ticker_source
         else:
             tickers = [t.strip().upper() for t in ticker_input.splitlines() if t.strip()]
+            st.session_state.pop("ticker_source", None)
 
         with st.spinner(f"Screening {len(tickers)} tickers…"):
             st.session_state["tickers"] = tickers
