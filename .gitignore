@@ -1,3 +1,10 @@
+# Trade data (personal financial data — do not commit)
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.csv
+data/*.csv.bak
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

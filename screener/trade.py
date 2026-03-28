@@ -12,15 +12,9 @@ import yfinance as yf
 import streamlit as st
 
 from screener.utils import get_ticker_info, get_ticker_financials
+from screener import db
 
 PORTFOLIO_SIZE = 8_000.0
-TRADE_LOG_PATH = "data/trade_log.csv"
-
-TRADE_LOG_COLUMNS = [
-    "timestamp", "ticker", "entry", "target", "stop", "rr",
-    "setup_score", "upside_pct", "summary",
-    "actual_entry", "actual_exit", "outcome_notes", "status",
-]
 
 
 # ---------------------------------------------------------------------------
@@ -363,16 +357,26 @@ def analyze_trade(ticker: str) -> dict:
         },
         "setup_score": setup_score,
         "summary": summary,
+        "sector": sector,
     }
 
 
 # ---------------------------------------------------------------------------
-# Trade log
+# Trade log (SQLite-backed via screener.db)
 # ---------------------------------------------------------------------------
 
-def save_trade_idea(trade: dict) -> None:
-    """Append a trade card to data/trade_log.csv."""
+def save_trade_idea(
+    trade: dict,
+    signal_source: str = "Manual",
+    thesis: str = "",
+    conviction: int = 0,
+) -> int:
+    """
+    Save a trade idea to the SQLite database.
+    Returns the new trade row id.
+    """
     ee = trade["entry_exit"]
+    moderate_shares = trade["sizing"]["moderate"]["shares"]
     row = {
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
         "ticker": trade["ticker"],
@@ -382,36 +386,181 @@ def save_trade_idea(trade: dict) -> None:
         "rr": ee["rr"],
         "setup_score": trade["setup_score"],
         "upside_pct": ee["upside_pct"],
+        "shares": moderate_shares,
         "summary": trade["summary"],
-        "actual_entry": "",
-        "actual_exit": "",
+        "actual_entry": None,
+        "actual_exit": None,
         "outcome_notes": "",
-        "status": "Open",
+        "status": "Watching",
+        "signal_source": signal_source,
+        "thesis": thesis,
+        "conviction": conviction,
+        "suggested_hold_period": trade["momentum"]["holding_period"],
+        "sector": trade.get("sector", ""),
     }
-    os.makedirs("data", exist_ok=True)
-    df_new = pd.DataFrame([row])
-    if os.path.exists(TRADE_LOG_PATH):
-        existing = pd.read_csv(TRADE_LOG_PATH, dtype=str).fillna("")
-        combined = pd.concat([existing, df_new], ignore_index=True)
-    else:
-        combined = df_new
-    combined.to_csv(TRADE_LOG_PATH, index=False)
+    trade_id = db.save_trade(row)
+    compute_paper_stats.clear()
+    return trade_id
 
 
 def load_trade_log() -> pd.DataFrame:
-    """Load the trade log CSV. Returns an empty DataFrame if not found."""
-    if not os.path.exists(TRADE_LOG_PATH):
-        return pd.DataFrame(columns=TRADE_LOG_COLUMNS)
-    try:
-        return pd.read_csv(TRADE_LOG_PATH, dtype=str).fillna("")
-    except Exception:
-        return pd.DataFrame(columns=TRADE_LOG_COLUMNS)
+    """Load the full trade log from SQLite. Returns empty DataFrame if none."""
+    return db.load_trades()
 
 
 def save_trade_log(df: pd.DataFrame) -> None:
-    """Write the full trade log DataFrame back to CSV (used for updates)."""
+    """
+    Update trades from an edited DataFrame (used by st.data_editor).
+    Matches rows by 'id' column and updates changed fields.
+    """
+    if df.empty or "id" not in df.columns:
+        return
+    updates = []
+    for _, row in df.iterrows():
+        fields = {}
+        for col in ["actual_entry", "actual_exit", "outcome_notes", "status"]:
+            if col in row.index:
+                val = row[col]
+                if pd.notna(val):
+                    fields[col] = val
+        if fields:
+            updates.append({"id": int(row["id"]), "fields": fields})
+    if updates:
+        db.bulk_update_trades(updates)
+        compute_paper_stats.clear()
+
+
+@st.cache_data(ttl=300)  # refresh every 5 minutes
+def fetch_current_prices(tickers: tuple) -> dict:
+    """
+    Fetch the latest close price for each ticker.
+    Returns dict mapping ticker -> float price (missing tickers omitted).
+    """
+    if not tickers:
+        return {}
     try:
-        os.makedirs("data", exist_ok=True)
-        df.to_csv(TRADE_LOG_PATH, index=False)
+        if len(tickers) == 1:
+            raw = yf.download(tickers[0], period="2d", auto_adjust=True, progress=False)
+            if raw.empty:
+                return {}
+            return {tickers[0]: float(raw["Close"].iloc[-1])}
+        raw = yf.download(
+            list(tickers), period="2d", auto_adjust=True, progress=False, group_by="ticker"
+        )
+        if raw.empty:
+            return {}
+        result = {}
+        lvl0 = set(raw.columns.get_level_values(0))
+        for t in tickers:
+            if t in lvl0:
+                try:
+                    price = float(raw[t]["Close"].dropna().iloc[-1])
+                    result[t] = price
+                except Exception:
+                    pass
+        return result
     except Exception:
-        pass
+        return {}
+
+
+@st.cache_data(ttl=300)
+def compute_paper_stats() -> dict:
+    """
+    Compute paper trading performance stats from the SQLite trade log.
+    No-arg signature so Streamlit cache keys work correctly.
+    Call compute_paper_stats.clear() after any trade mutation.
+
+    Returns dict with:
+        open_df, closed_df, watching_df — DataFrames
+        total_realized_pnl, total_unrealized_pnl — floats
+        win_rate, avg_win, avg_loss — floats or None
+        live_prices — dict of current prices
+    """
+    df = db.load_trades()
+
+    if df.empty:
+        return {
+            "open_df": pd.DataFrame(),
+            "closed_df": pd.DataFrame(),
+            "watching_df": pd.DataFrame(),
+            "total_realized_pnl": 0.0,
+            "total_unrealized_pnl": 0.0,
+            "win_rate": None,
+            "avg_win": None,
+            "avg_loss": None,
+            "live_prices": {},
+        }
+
+    df = df.copy()
+    # SQLite returns proper types, but coerce for safety
+    for col in ("shares", "actual_entry", "actual_exit"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["shares_n"] = df["shares"].fillna(0)
+    df["actual_entry_n"] = df["actual_entry"]
+    df["actual_exit_n"] = df["actual_exit"]
+
+    # ── Split by status ──────────────────────────────────────────────────────
+    open_mask = df["status"] == "Executed"
+    closed_mask = df["status"].str.startswith("Closed", na=False)
+    watch_mask = df["status"] == "Watching"
+
+    open_df = df[open_mask].copy()
+    closed_df = df[closed_mask].copy()
+    watching_df = df[watch_mask].copy()
+
+    # Fetch live prices for open positions that have an actual entry
+    open_tickers = tuple(sorted(
+        t for t in open_df["ticker"].unique()
+        if open_df.loc[open_df["ticker"] == t, "actual_entry_n"].notna().any()
+    ))
+    live_prices = fetch_current_prices(open_tickers) if open_tickers else {}
+
+    if not open_df.empty:
+        open_df["live_price"] = open_df["ticker"].map(live_prices)
+        open_df["unreal_pnl"] = (
+            (open_df["live_price"] - open_df["actual_entry_n"]) * open_df["shares_n"]
+        )
+        open_df["unreal_pnl_pct"] = (
+            (open_df["live_price"] - open_df["actual_entry_n"])
+            / open_df["actual_entry_n"].replace(0, float("nan"))
+            * 100
+        )
+        total_unrealized_pnl = open_df["unreal_pnl"].fillna(0).sum()
+    else:
+        total_unrealized_pnl = 0.0
+
+    # ── Closed positions ─────────────────────────────────────────────────────
+    if not closed_df.empty:
+        closed_df["real_pnl"] = (
+            (closed_df["actual_exit_n"] - closed_df["actual_entry_n"])
+            * closed_df["shares_n"]
+        )
+        closed_df["real_pnl_pct"] = (
+            (closed_df["actual_exit_n"] - closed_df["actual_entry_n"])
+            / closed_df["actual_entry_n"].replace(0, float("nan"))
+            * 100
+        )
+        valid_closed = closed_df.dropna(subset=["real_pnl"])
+        total_realized_pnl = valid_closed["real_pnl"].sum()
+        wins = valid_closed[valid_closed["real_pnl"] > 0]["real_pnl"]
+        losses = valid_closed[valid_closed["real_pnl"] <= 0]["real_pnl"]
+        win_rate = round(len(wins) / len(valid_closed) * 100, 1) if len(valid_closed) > 0 else None
+        avg_win = round(float(wins.mean()), 2) if not wins.empty else None
+        avg_loss = round(float(losses.mean()), 2) if not losses.empty else None
+    else:
+        total_realized_pnl = 0.0
+        win_rate = avg_win = avg_loss = None
+
+    return {
+        "open_df": open_df,
+        "closed_df": closed_df,
+        "watching_df": watching_df,
+        "total_realized_pnl": round(total_realized_pnl, 2),
+        "total_unrealized_pnl": round(total_unrealized_pnl, 2),
+        "win_rate": win_rate,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "live_prices": live_prices,
+    }
