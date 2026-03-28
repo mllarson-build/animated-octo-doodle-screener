@@ -406,6 +406,7 @@ with tab_value:
     if st.button(f"Load Value Data ({len(_val_tickers)} tickers)", key="btn_load_value"):
         with st.spinner(f"Screening {len(_val_tickers)} tickers…"):
             st.session_state["value_df"] = fetch_value_data(_val_tickers)
+            st.session_state["last_screen"] = "Value Recovery"
 
     if "value_df" not in st.session_state:
         st.info(
@@ -448,6 +449,7 @@ with tab_growth:
     if st.button(f"Load Growth Data ({len(_grw_tickers)} tickers)", key="btn_load_growth"):
         with st.spinner(f"Screening {len(_grw_tickers)} tickers…"):
             st.session_state["growth_df"] = fetch_growth_data(_grw_tickers)
+            st.session_state["last_screen"] = "Growth Momentum"
 
     if "growth_df" not in st.session_state:
         st.info(
@@ -495,6 +497,7 @@ with tab_options:
                 result = fetch_options_data(selected_ticker)
                 st.session_state["opt_data"] = result
                 st.session_state["opt_ticker_loaded"] = selected_ticker
+                st.session_state["last_screen"] = "Options"
             except Exception as e:
                 st.error(f"Could not load options for {selected_ticker}: {e}")
                 st.session_state.pop("opt_data", None)
@@ -604,13 +607,140 @@ with tab_etfs:
 
 # ── Trade Builder ─────────────────────────────────────────────────────────────
 with tab_trade:
-    st.subheader("Trade Builder")
-    st.caption(
-        "Select a ticker to generate a structured trade idea with price levels, "
-        "position sizing, momentum signals, hedge suggestions, and a paper trade log."
-    )
+    from screener.db import close_trade as db_close_trade, execute_trade as db_execute_trade, HOLD_PERIOD_DAYS
 
-    # Ticker selection — prefer watchlist, allow manual entry
+    st.subheader("Trade")
+
+    # ── Daily P&L Summary (top of tab — glanceable health check) ─────────────
+    _stats = compute_paper_stats()
+    _open_df = _stats["open_df"]
+    _closed_df = _stats["closed_df"]
+    _watch_df = _stats["watching_df"]
+    _has_any_trades = not _open_df.empty or not _closed_df.empty or not _watch_df.empty
+
+    if _has_any_trades:
+        _pm1, _pm2, _pm3, _pm4 = st.columns(4)
+        _pm1.metric(
+            "Unrealized P&L",
+            f"${_stats['total_unrealized_pnl']:+,.2f}" if not _open_df.empty else "—",
+            delta_color="normal" if _stats["total_unrealized_pnl"] >= 0 else "inverse",
+        )
+        _pm2.metric(
+            "Realized P&L",
+            f"${_stats['total_realized_pnl']:+,.2f}" if not _closed_df.empty else "—",
+            delta_color="normal" if _stats["total_realized_pnl"] >= 0 else "inverse",
+        )
+        # Best / worst open position by unrealized P&L %
+        _best_today = _worst_today = "—"
+        if not _open_df.empty and "unreal_pnl_pct" in _open_df.columns:
+            _valid_pnl = _open_df.dropna(subset=["unreal_pnl_pct"])
+            if not _valid_pnl.empty:
+                _best_row = _valid_pnl.loc[_valid_pnl["unreal_pnl_pct"].idxmax()]
+                _worst_row = _valid_pnl.loc[_valid_pnl["unreal_pnl_pct"].idxmin()]
+                _best_today = f"{_best_row['ticker']} ({_best_row['unreal_pnl_pct']:+.1f}%)"
+                _worst_today = f"{_worst_row['ticker']} ({_worst_row['unreal_pnl_pct']:+.1f}%)"
+        _pm3.metric("Best Open", _best_today, delta_color="off")
+        _pm4.metric("Worst Open", _worst_today, delta_color="off")
+        st.divider()
+
+    # ── Open Positions with Close Trade Flow ──────────────────────────────────
+    if not _open_df.empty:
+        st.markdown("**Open Positions**")
+        for _idx, _row in _open_df.iterrows():
+            _live = _row.get("live_price")
+            _upnl = _row.get("unreal_pnl")
+            _upnl_p = _row.get("unreal_pnl_pct")
+            _ae = _row.get("actual_entry_n")
+            _shares = int(float(_row["shares_n"])) if _row.get("shares_n") else 0
+            _tid = int(_row["id"]) if "id" in _row.index else None
+
+            # Holding period countdown
+            _hold_text = ""
+            _held_days = 0
+            if _row.get("executed_at"):
+                try:
+                    from datetime import datetime as _dt
+                    _exec_date = _dt.strptime(str(_row["executed_at"])[:10], "%Y-%m-%d")
+                    _held_days = (datetime.now() - _exec_date).days
+                    _suggested = _row.get("suggested_hold_period", "")
+                    _target_days = HOLD_PERIOD_DAYS.get(_suggested, 0)
+                    if _target_days > 0:
+                        _remaining = _target_days - _held_days
+                        _pct_elapsed = _held_days / _target_days
+                        if _pct_elapsed < 0.75:
+                            _hold_color = "#1a7a1a"
+                        elif _pct_elapsed < 1.0:
+                            _hold_color = "#7a7a00"
+                        else:
+                            _hold_color = "#7a1a1a"
+                        _hold_text = f"Held: {_held_days}d / {_target_days}d"
+                    else:
+                        _hold_text = f"Held: {_held_days}d"
+                        _hold_color = "#444"
+                except Exception:
+                    _hold_text = ""
+                    _hold_color = "#444"
+
+            _oc1, _oc2, _oc3, _oc4, _oc5, _oc6 = st.columns([1.2, 1, 1, 1, 1.2, 1.5])
+            _oc1.markdown(f"**{_row['ticker']}**")
+            _oc2.markdown(f"Entry: ${float(_ae):.2f}" if _ae else "Entry: —")
+            _oc3.markdown(f"Live: ${_live:.2f}" if _live else "Live: N/A")
+            _pnl_str = f"${_upnl:+,.2f} ({_upnl_p:+.1f}%)" if _upnl is not None and _upnl == _upnl else "—"
+            _oc4.markdown(f"P&L: {_pnl_str}")
+            if _hold_text:
+                _oc5.markdown(
+                    f"<span style='color:{_hold_color}'>{_hold_text}</span>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                _oc5.markdown("")
+
+            # Two-step close: click Close → expand details → Confirm
+            if _tid is not None:
+                _close_key = f"close_{_tid}"
+                if _oc6.button("Close", key=_close_key, disabled=st.session_state.get(f"closing_{_tid}", False)):
+                    st.session_state[f"show_close_{_tid}"] = True
+
+                if st.session_state.get(f"show_close_{_tid}", False):
+                    st.session_state[f"closing_{_tid}"] = True
+                    _cc1, _cc2, _cc3 = st.columns([1, 1, 1])
+                    with _cc1:
+                        _exit_price = st.number_input(
+                            "Exit Price",
+                            value=float(_live) if _live else 0.0,
+                            format="%.2f",
+                            key=f"exit_price_{_tid}",
+                        )
+                    with _cc2:
+                        _exit_reason = st.selectbox(
+                            "Exit Reason",
+                            ["Hit Target", "Hit Stop", "Manual Exit", "Thesis Invalidated"],
+                            key=f"exit_reason_{_tid}",
+                        )
+                    with _cc3:
+                        st.markdown("")  # spacer
+                        if st.button("Confirm Close", key=f"confirm_close_{_tid}", type="primary"):
+                            try:
+                                _result = db_close_trade(_tid, _exit_price, _exit_reason)
+                                compute_paper_stats.clear()
+                                st.success(
+                                    f"{_row['ticker']} closed. "
+                                    f"P&L: ${_result['pnl']:+,.2f} ({_result['status']})"
+                                )
+                                st.session_state.pop(f"show_close_{_tid}", None)
+                                st.session_state.pop(f"closing_{_tid}", None)
+                                st.rerun()
+                            except Exception as _e:
+                                st.error(f"Could not close trade: {_e}")
+                        if st.button("Cancel", key=f"cancel_close_{_tid}"):
+                            st.session_state.pop(f"show_close_{_tid}", None)
+                            st.session_state.pop(f"closing_{_tid}", None)
+                            st.rerun()
+
+        st.divider()
+
+    # ── Trade Analyzer ────────────────────────────────────────────────────────
+    st.markdown("**Analyze a Trade**")
     _watchlist = st.session_state.get(
         "tickers", [t.strip() for t in DEFAULT_TICKERS.splitlines() if t.strip()]
     )
@@ -679,29 +809,10 @@ with tab_trade:
         st.markdown("**Entry / Exit Framework**")
         _m1, _m2, _m3, _m4, _m5 = st.columns(5)
         _m1.metric("Current Price", f"${_tc['current_price']:.2f}")
-        _m2.metric(
-            "Entry Zone",
-            f"${_ee['entry']:.2f}",
-            delta=f"to ${_ee['entry_low']:.2f}",
-            delta_color="off",
-        )
-        _m3.metric(
-            "Price Target",
-            f"${_ee['target']:.2f}",
-            delta=f"+{_ee['upside_pct']:.1f}%",
-        )
-        _m4.metric(
-            "Stop Loss",
-            f"${_ee['stop']:.2f}",
-            delta=f"-8.0%",
-            delta_color="inverse",
-        )
-        _m5.metric(
-            "Risk/Reward",
-            f"{_ee['rr']:.1f}:1",
-            delta="Good" if _ee["good_setup"] else "Weak",
-            delta_color="normal" if _ee["good_setup"] else "inverse",
-        )
+        _m2.metric("Entry Zone", f"${_ee['entry']:.2f}", delta=f"to ${_ee['entry_low']:.2f}", delta_color="off")
+        _m3.metric("Price Target", f"${_ee['target']:.2f}", delta=f"+{_ee['upside_pct']:.1f}%")
+        _m4.metric("Stop Loss", f"${_ee['stop']:.2f}", delta="-8.0%", delta_color="inverse")
+        _m5.metric("Risk/Reward", f"{_ee['rr']:.1f}:1", delta="Good" if _ee["good_setup"] else "Weak", delta_color="normal" if _ee["good_setup"] else "inverse")
         st.caption(f"Target source: {_ee['target_source']}")
 
         st.divider()
@@ -718,7 +829,7 @@ with tab_trade:
 
         st.divider()
 
-        # ── Position sizing (portfolio = $8,000) ──────────────────────────────
+        # ── Position sizing ──────────────────────────────────────────────────
         st.markdown("**Position Sizing** — based on $8,000 portfolio")
         _sz_rows = []
         for _lbl, _s in _sz.items():
@@ -734,38 +845,15 @@ with tab_trade:
 
         st.divider()
 
-        # ── Momentum & timing ─────────────────────────────────────────────────
+        # ── Momentum & timing ────────────────────────────────────────────────
         st.markdown("**Momentum & Timing**")
         _mc1, _mc2, _mc3, _mc4, _mc5 = st.columns(5)
         _rsi_val = _mo["rsi"]
-        _mc1.metric(
-            "RSI (14)",
-            f"{_rsi_val:.1f}" if _rsi_val is not None else "N/A",
-            delta=_mo["rsi_label"],
-            delta_color="off",
-        )
-        _mc2.metric(
-            "MACD Signal",
-            "Bullish cross" if _mo["macd_bullish_crossover"] else "No cross",
-            delta="Last 5 days",
-            delta_color="off",
-        )
-        _mc3.metric(
-            "vs 50-day MA",
-            "Above" if _mo["above_50ma"] else "Below" if _mo["above_50ma"] is not None else "N/A",
-            delta_color="off",
-        )
-        _mc4.metric(
-            "vs 200-day MA",
-            "Above" if _mo["above_200ma"] else "Below" if _mo["above_200ma"] is not None else "N/A",
-            delta_color="off",
-        )
-        _mc5.metric(
-            "ATR (14d)",
-            f"${_mo['atr']:.2f}" if _mo["atr"] else "N/A",
-            delta=f"{_mo['atr_pct']:.1f}% of price" if _mo["atr_pct"] else None,
-            delta_color="off",
-        )
+        _mc1.metric("RSI (14)", f"{_rsi_val:.1f}" if _rsi_val is not None else "N/A", delta=_mo["rsi_label"], delta_color="off")
+        _mc2.metric("MACD Signal", "Bullish cross" if _mo["macd_bullish_crossover"] else "No cross", delta="Last 5 days", delta_color="off")
+        _mc3.metric("vs 50-day MA", "Above" if _mo["above_50ma"] else "Below" if _mo["above_50ma"] is not None else "N/A", delta_color="off")
+        _mc4.metric("vs 200-day MA", "Above" if _mo["above_200ma"] else "Below" if _mo["above_200ma"] is not None else "N/A", delta_color="off")
+        _mc5.metric("ATR (14d)", f"${_mo['atr']:.2f}" if _mo["atr"] else "N/A", delta=f"{_mo['atr_pct']:.1f}% of price" if _mo["atr_pct"] else None, delta_color="off")
         if _mo["macd_bullish_crossover"]:
             st.success("MACD bullish crossover detected in the last 5 trading days.")
         if _mo["above_200ma"] is True:
@@ -776,50 +864,33 @@ with tab_trade:
 
         st.divider()
 
-        # ── Hedge suggestions ─────────────────────────────────────────────────
+        # ── Hedge suggestions ────────────────────────────────────────────────
         st.markdown("**Hedge Suggestions**")
         _hc1, _hc2 = st.columns(2)
-
         with _hc1:
             st.markdown("**Protective Put**")
             _pp = _hg["protective_put"]
             if _pp:
-                st.markdown(
-                    f"Buy **{_pp['num_contracts']} put contract(s)** at "
-                    f"**${_pp['strike']:.2f} strike** expiring **{_pp['expiration']}**"
-                )
-                st.markdown(
-                    f"- Premium: ${_pp['premium_per_share']:.2f}/share "
-                    f"({_pp['cost_pct_of_position']:.1f}% of position)"
-                )
+                st.markdown(f"Buy **{_pp['num_contracts']} put(s)** at **${_pp['strike']:.2f} strike** exp **{_pp['expiration']}**")
+                st.markdown(f"- Premium: ${_pp['premium_per_share']:.2f}/share ({_pp['cost_pct_of_position']:.1f}% of position)")
                 st.markdown(f"- Total put cost: **${_pp['total_cost']:,.2f}**")
                 st.markdown(f"- Breakeven (inc. put cost): **${_pp['breakeven_with_put']:.2f}**")
             elif _sz["moderate"]["total_cost"] <= 500:
                 st.caption("Position < $500 — protective put not warranted.")
             else:
                 st.caption("No suitable put found near the 5-10% OTM range.")
-
         with _hc2:
             st.markdown(f"**Portfolio Hedge — {_hg['hedge_etf_symbol']}** ({_hg['hedge_etf_desc']})")
-            st.markdown(
-                f"A 10% portfolio allocation of **${_hg['hedge_alloc_10pct']:,.2f}** to "
-                f"**{_hg['hedge_etf_symbol']}** provides inverse market exposure to "
-                f"partially offset losses if the broader market sells off."
-            )
-            st.caption(
-                "Inverse ETFs decay over time and are best used as short-term hedges "
-                "during elevated volatility periods."
-            )
+            st.markdown(f"A 10% portfolio allocation of **${_hg['hedge_alloc_10pct']:,.2f}** to **{_hg['hedge_etf_symbol']}** provides inverse market exposure.")
+            st.caption("Inverse ETFs decay over time and are best used as short-term hedges during elevated volatility.")
 
         st.divider()
 
-        # ── Fundamental snapshot ──────────────────────────────────────────────
+        # ── Fundamental snapshot ─────────────────────────────────────────────
         st.markdown("**Fundamental Snapshot**")
         _fc1, _fc2, _fc3 = st.columns(3)
-
         def _fmt(v, fmt=".2f", suffix=""):
             return f"{v:{fmt}}{suffix}" if v is not None else "N/A"
-
         with _fc1:
             st.markdown(f"**Trailing P/E:** {_fmt(_fu['trailing_pe'])}")
             st.markdown(f"**Forward P/E:** {_fmt(_fu['forward_pe'])}")
@@ -832,140 +903,90 @@ with tab_trade:
             st.markdown(f"**Earn Growth (YoY):** {_fmt(_fu['earn_growth'], '.1f', '%')}")
         with _fc3:
             st.markdown(f"**Short Interest:** {_fmt(_fu['short_pct'], '.1f', '%')}")
-            _analysts_str = (
-                f"{_fu['num_analysts']} analysts" if _fu["num_analysts"] else "N/A"
-            )
+            _analysts_str = f"{_fu['num_analysts']} analysts" if _fu["num_analysts"] else "N/A"
             st.markdown(f"**Analyst Consensus:** {_fu['rec_label']} ({_analysts_str})")
             if _fu["rec_mean"] is not None:
                 st.markdown(f"**Rating Mean:** {_fu['rec_mean']:.2f} (1=Strong Buy, 5=Sell)")
 
         st.divider()
 
-        # ── Save trade idea ───────────────────────────────────────────────────
-        if st.button("Save Trade Idea to Log", key="tb_save"):
-            save_trade_idea(_tc)
-            st.success(f"Trade idea for {_sym} saved to trade log.")
-
-    # ── Paper Trading Dashboard ────────────────────────────────────────────────
-    st.divider()
-    st.subheader("Paper Trading Tracker")
-    st.caption(
-        "Track hypothetical trades to validate your screening process without risking capital. "
-        "Save ideas above, then update **Status → Executed** with your actual entry price to "
-        "start tracking live P&L. Live prices refresh every 5 minutes."
-    )
-
-    _log_df = load_trade_log()
-
-    if _log_df.empty:
-        st.info("No trade ideas saved yet. Analyze a ticker above and click **Save Trade Idea**.")
-    else:
-        _stats = compute_paper_stats()
-        _open_df    = _stats["open_df"]
-        _closed_df  = _stats["closed_df"]
-        _watch_df   = _stats["watching_df"]
-
-        # ── Summary metrics row ───────────────────────────────────────────────
-        _pm1, _pm2, _pm3, _pm4, _pm5 = st.columns(5)
-        _pm1.metric("Watching", len(_watch_df))
-        _pm2.metric("Open Positions", len(_open_df))
-        _pm3.metric(
-            "Unrealized P&L",
-            f"${_stats['total_unrealized_pnl']:+,.2f}",
-            delta_color="normal" if _stats["total_unrealized_pnl"] >= 0 else "inverse",
-        )
-        _pm4.metric(
-            "Realized P&L",
-            f"${_stats['total_realized_pnl']:+,.2f}",
-            delta_color="normal" if _stats["total_realized_pnl"] >= 0 else "inverse",
-        )
-        _pm5.metric(
-            "Win Rate",
-            f"{_stats['win_rate']:.1f}%" if _stats["win_rate"] is not None else "—",
-            delta=(
-                f"Avg W: ${_stats['avg_win']:+,.0f}  L: ${_stats['avg_loss']:+,.0f}"
-                if _stats["avg_win"] is not None and _stats["avg_loss"] is not None
-                else None
-            ),
-            delta_color="off",
-        )
-
-        st.divider()
-
-        # ── Open positions with live P&L ──────────────────────────────────────
-        if not _open_df.empty:
-            st.markdown("**Open Positions (Executed)**")
-            _open_display_rows = []
-            for _, _row in _open_df.iterrows():
-                _live   = _row.get("live_price")
-                _upnl   = _row.get("unreal_pnl")
-                _upnl_p = _row.get("unreal_pnl_pct")
-                _ae     = _row.get("actual_entry_n")
-                _shares = int(float(_row["shares_n"])) if _row["shares_n"] else 0
-
-                _open_display_rows.append({
-                    "Ticker":       _row["ticker"],
-                    "Entry":        f"${float(_ae):.2f}" if _ae else "—",
-                    "Target":       f"${float(_row['target']):.2f}" if _row.get("target") else "—",
-                    "Stop":         f"${float(_row['stop']):.2f}" if _row.get("stop") else "—",
-                    "Shares":       _shares,
-                    "Live Price":   f"${_live:.2f}" if _live else "N/A",
-                    "Unreal. P&L":  f"${_upnl:+,.2f}" if _upnl is not None and _upnl == _upnl else "—",
-                    "Unreal. %":    f"{_upnl_p:+.2f}%" if _upnl_p is not None and _upnl_p == _upnl_p else "—",
-                    "Date":         _row["timestamp"],
-                    "Notes":        _row.get("outcome_notes", ""),
-                })
-            st.dataframe(
-                pd.DataFrame(_open_display_rows),
-                use_container_width=True,
-                hide_index=True,
+        # ── Save trade idea with signal source + thesis + conviction ─────────
+        st.markdown("**Save Trade Idea**")
+        _save_col1, _save_col2 = st.columns([2, 1])
+        with _save_col1:
+            _signal_source = st.selectbox(
+                "Signal Source",
+                ["Value Recovery", "Growth Momentum", "Options", "Manual"],
+                index=["Value Recovery", "Growth Momentum", "Options", "Manual"].index(
+                    st.session_state.get("last_screen", "Manual")
+                ) if st.session_state.get("last_screen", "Manual") in ["Value Recovery", "Growth Momentum", "Options", "Manual"] else 3,
+                key="tb_signal_source",
             )
-            st.divider()
+        with _save_col2:
+            _conviction = st.slider("Conviction", 1, 5, 3, key="tb_conviction")
+        _thesis = st.text_area(
+            "Trade Thesis",
+            placeholder="Why are you taking this trade? What could invalidate it?",
+            max_chars=500,
+            key="tb_thesis",
+        )
 
-        # ── Watching list ─────────────────────────────────────────────────────
-        if not _watch_df.empty:
-            with st.expander(f"Watchlist ({len(_watch_df)} ideas)", expanded=True):
-                _watch_display = _watch_df[[
-                    "timestamp", "ticker", "entry", "target", "stop", "rr", "setup_score", "upside_pct", "shares"
-                ]].copy()
-                _watch_display.columns = [
-                    "Date", "Ticker", "Planned Entry", "Target", "Stop", "R/R", "Score", "Upside %", "Shares"
-                ]
-                st.dataframe(_watch_display, use_container_width=True, hide_index=True)
+        if st.button("Save Trade Idea", key="tb_save", disabled=st.session_state.get("_save_pending", False)):
+            save_trade_idea(
+                _tc,
+                signal_source=_signal_source,
+                thesis=_thesis,
+                conviction=_conviction,
+            )
+            st.success(f"Trade idea for {_sym} saved ({_signal_source}, conviction {_conviction}/5).")
 
-        # ── Closed trades ─────────────────────────────────────────────────────
-        if not _closed_df.empty:
-            with st.expander(f"Closed Trades ({len(_closed_df)})", expanded=False):
-                _closed_rows = []
-                for _, _row in _closed_df.iterrows():
-                    _rpnl   = _row.get("real_pnl")
-                    _rpnl_p = _row.get("real_pnl_pct")
-                    _closed_rows.append({
-                        "Ticker":    _row["ticker"],
-                        "Entry":     f"${float(_row['actual_entry_n']):.2f}" if _row.get("actual_entry_n") else "—",
-                        "Exit":      f"${float(_row['actual_exit_n']):.2f}" if _row.get("actual_exit_n") else "—",
-                        "Shares":    int(float(_row["shares_n"])) if _row.get("shares_n") else 0,
-                        "Real. P&L": f"${_rpnl:+,.2f}" if _rpnl is not None and _rpnl == _rpnl else "—",
-                        "Real. %":   f"{_rpnl_p:+.2f}%" if _rpnl_p is not None and _rpnl_p == _rpnl_p else "—",
-                        "Outcome":   _row["status"],
-                        "Notes":     _row.get("outcome_notes", ""),
-                        "Date":      _row["timestamp"],
-                    })
-                st.dataframe(pd.DataFrame(_closed_rows), use_container_width=True, hide_index=True)
-
+    # ── Watchlist ─────────────────────────────────────────────────────────────
+    if not _watch_df.empty:
         st.divider()
+        with st.expander(f"Watchlist ({len(_watch_df)} ideas)", expanded=True):
+            _watch_cols = ["timestamp", "ticker", "entry", "target", "stop", "rr",
+                           "setup_score", "upside_pct", "shares", "signal_source", "conviction"]
+            _avail_cols = [c for c in _watch_cols if c in _watch_df.columns]
+            _watch_display = _watch_df[_avail_cols].copy()
+            _watch_display.columns = [
+                c.replace("_", " ").title() for c in _avail_cols
+            ]
+            st.dataframe(_watch_display, use_container_width=True, hide_index=True)
 
-        # ── Full editable log ─────────────────────────────────────────────────
+    # ── Closed trades ────────────────────────────────────────────────────────
+    if not _closed_df.empty:
+        with st.expander(f"Closed Trades ({len(_closed_df)})", expanded=False):
+            _closed_rows = []
+            for _, _row in _closed_df.iterrows():
+                _rpnl = _row.get("real_pnl")
+                _rpnl_p = _row.get("real_pnl_pct")
+                _closed_rows.append({
+                    "Ticker": _row["ticker"],
+                    "Entry": f"${float(_row['actual_entry_n']):.2f}" if _row.get("actual_entry_n") else "—",
+                    "Exit": f"${float(_row['actual_exit_n']):.2f}" if _row.get("actual_exit_n") else "—",
+                    "Shares": int(float(_row["shares_n"])) if _row.get("shares_n") else 0,
+                    "Real. P&L": f"${_rpnl:+,.2f}" if _rpnl is not None and _rpnl == _rpnl else "—",
+                    "Real. %": f"{_rpnl_p:+.2f}%" if _rpnl_p is not None and _rpnl_p == _rpnl_p else "—",
+                    "Reason": _row.get("exit_reason", ""),
+                    "Signal": _row.get("signal_source", ""),
+                    "Date": _row["timestamp"],
+                })
+            st.dataframe(pd.DataFrame(_closed_rows), use_container_width=True, hide_index=True)
+
+    # ── Full editable log ────────────────────────────────────────────────────
+    st.divider()
+    _log_df = load_trade_log()
+    if not _log_df.empty:
         with st.expander("Edit Trade Log", expanded=False):
             st.caption(
-                "Update **Actual Entry**, **Actual Exit**, **Outcome Notes**, and **Status** "
-                "inline. Set Status to **Executed** once you've entered a position. "
+                "Update **Actual Entry**, **Outcome Notes**, and **Status** inline. "
+                "Use the **Close** button above for executed positions. "
                 "Click **Save Changes** to persist."
             )
             _edit_cols = [c for c in _log_df.columns if c in [
-                "timestamp", "ticker", "entry", "target", "stop", "rr",
-                "setup_score", "upside_pct", "shares",
-                "actual_entry", "actual_exit", "outcome_notes", "status",
+                "id", "timestamp", "ticker", "entry", "target", "stop", "rr",
+                "setup_score", "shares",
+                "actual_entry", "outcome_notes", "status",
             ]]
             _edited = st.data_editor(
                 _log_df[_edit_cols] if _edit_cols else _log_df,
@@ -973,30 +994,26 @@ with tab_trade:
                 hide_index=True,
                 num_rows="fixed",
                 column_config={
-                    "timestamp":   st.column_config.TextColumn("Date", disabled=True),
-                    "ticker":      st.column_config.TextColumn("Ticker", disabled=True),
-                    "entry":       st.column_config.NumberColumn("Plan Entry", format="$%.2f", disabled=True),
-                    "target":      st.column_config.NumberColumn("Target", format="$%.2f", disabled=True),
-                    "stop":        st.column_config.NumberColumn("Stop", format="$%.2f", disabled=True),
-                    "rr":          st.column_config.NumberColumn("R/R", format="%.1f", disabled=True),
+                    "id": st.column_config.NumberColumn("ID", disabled=True),
+                    "timestamp": st.column_config.TextColumn("Date", disabled=True),
+                    "ticker": st.column_config.TextColumn("Ticker", disabled=True),
+                    "entry": st.column_config.NumberColumn("Plan Entry", format="$%.2f", disabled=True),
+                    "target": st.column_config.NumberColumn("Target", format="$%.2f", disabled=True),
+                    "stop": st.column_config.NumberColumn("Stop", format="$%.2f", disabled=True),
+                    "rr": st.column_config.NumberColumn("R/R", format="%.1f", disabled=True),
                     "setup_score": st.column_config.NumberColumn("Score", disabled=True),
-                    "upside_pct":  st.column_config.NumberColumn("Upside %", format="%.1f%%", disabled=True),
-                    "shares":      st.column_config.NumberColumn("Shares", disabled=True),
+                    "shares": st.column_config.NumberColumn("Shares", disabled=True),
                     "actual_entry": st.column_config.NumberColumn("Actual Entry", format="$%.2f"),
-                    "actual_exit":  st.column_config.NumberColumn("Actual Exit", format="$%.2f"),
                     "outcome_notes": st.column_config.TextColumn("Notes", width="medium"),
                     "status": st.column_config.SelectboxColumn(
                         "Status",
-                        options=["Watching", "Executed", "Closed — Win", "Closed — Loss", "Cancelled"],
+                        options=["Watching", "Executed", "Cancelled"],
                     ),
                 },
                 key="trade_log_editor",
             )
             if st.button("Save Changes", key="tb_log_save"):
-                # Merge edited columns back into full log
-                for col in _edited.columns:
-                    _log_df[col] = _edited[col].values
-                save_trade_log(_log_df)
+                save_trade_log(_edited)
                 st.success("Trade log updated.")
 
 # ── Backtest ──────────────────────────────────────────────────────────────────
