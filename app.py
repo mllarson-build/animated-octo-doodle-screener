@@ -395,8 +395,8 @@ ETF_COLUMN_CONFIG = {
 # ---------------------------------------------------------------------------
 # Main tabs
 # ---------------------------------------------------------------------------
-tab_value, tab_growth, tab_options, tab_etfs, tab_trade, tab_backtest = st.tabs(
-    ["Value Recovery", "Growth Momentum", "Options", "ETFs", "Trade Builder", "Backtest"]
+tab_value, tab_growth, tab_options, tab_etfs, tab_trade, tab_backtest, tab_edge = st.tabs(
+    ["Value", "Growth", "Options", "ETFs", "Trade", "Backtest", "My Edge"]
 )
 
 # ── Value Recovery ──────────────────────────────────────────────────────────
@@ -1303,3 +1303,218 @@ with tab_backtest:
                     "Win/Loss":     st.column_config.TextColumn("Result"),
                 },
             )
+
+# ── My Edge ──────────────────────────────────────────────────────────────────
+with tab_edge:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    from screener.analytics import (
+        compute_signal_scorecard,
+        compute_trade_stats,
+        compute_behavioral_patterns,
+        compute_sparklines,
+    )
+    from screener.db import load_trades
+
+    st.subheader("My Edge")
+
+    _edge_closed = load_trades(status_filter="Closed")
+
+    if _edge_closed.empty:
+        st.info(
+            "Start paper trading to build your edge data. After 5+ closed trades "
+            "per signal, you'll see which signals actually work for you."
+        )
+    else:
+        # ── Signal Scorecard (always visible) ────────────────────────────────
+        st.markdown("**Signal Scorecard**")
+        st.caption("Which signals make money? Win rate and average return grouped by signal source.")
+
+        _scorecard = compute_signal_scorecard(_edge_closed)
+        if _scorecard.empty:
+            st.info("No closed trades with signal attribution yet.")
+        else:
+            st.dataframe(_scorecard, use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # ── Closed Trade Stats (expanded by default) ─────────────────────────
+        with st.expander("Performance Stats", expanded=True):
+            _tstats = compute_trade_stats(_edge_closed)
+            if _tstats is None:
+                st.info("No closed trades with valid entry/exit prices.")
+            else:
+                _ts1, _ts2, _ts3, _ts4 = st.columns(4)
+                _ts1.metric("Win Rate", f"{_tstats['win_rate']:.1f}%")
+                _ts2.metric("Profit Factor", str(_tstats['profit_factor']))
+                _ts3.metric("Expectancy", f"{_tstats['expectancy']:+.2f}%",
+                            help="Expected return per trade: (win_rate * avg_win) + (loss_rate * avg_loss)")
+                _ts4.metric("Total Trades", _tstats['total_trades'])
+
+                _ts5, _ts6, _ts7, _ts8 = st.columns(4)
+                _ts5.metric("Avg Win", f"{_tstats['avg_win_pct']:+.2f}%")
+                _ts6.metric("Avg Loss", f"{_tstats['avg_loss_pct']:+.2f}%")
+                _ts7.metric("Avg Hold (W)",
+                            f"{_tstats['avg_hold_winners']:.0f}d" if _tstats['avg_hold_winners'] else "—")
+                _ts8.metric("Avg Hold (L)",
+                            f"{_tstats['avg_hold_losers']:.0f}d" if _tstats['avg_hold_losers'] else "—")
+
+                # Equity curve
+                if _tstats["equity_dates"] and len(_tstats["equity_dates"]) >= 2:
+                    st.markdown("**Equity Curve** (cumulative realized P&L)")
+                    _fig_eq = go.Figure()
+                    _fig_eq.add_trace(go.Scatter(
+                        x=_tstats["equity_dates"],
+                        y=_tstats["equity_values"],
+                        mode="lines+markers",
+                        line=dict(color="#4a9eff", width=2),
+                        marker=dict(size=5),
+                    ))
+                    _fig_eq.add_hline(y=0, line_dash="dot", line_color="gray")
+                    _fig_eq.update_layout(
+                        paper_bgcolor="#0e1117",
+                        plot_bgcolor="#1a1f2e",
+                        font_color="#fafafa",
+                        yaxis_title="Cumulative P&L ($)",
+                        xaxis_title="Close Date",
+                        margin=dict(l=10, r=10, t=10, b=10),
+                        showlegend=False,
+                        height=300,
+                    )
+                    st.plotly_chart(_fig_eq, use_container_width=True)
+                elif _tstats["equity_dates"]:
+                    st.caption(f"Equity curve needs 2+ closed trades (have {len(_tstats['equity_dates'])}).")
+
+        # ── Behavioral Patterns (collapsed by default) ───────────────────────
+        with st.expander("Behavioral Patterns", expanded=False):
+            _bpat = compute_behavioral_patterns(_edge_closed)
+            if _bpat is None:
+                st.info("No closed trades with valid data for behavioral analysis.")
+            else:
+                _bp_c1, _bp_c2 = st.columns(2)
+
+                # Conviction vs outcome scatter
+                with _bp_c1:
+                    st.markdown("**Conviction vs Outcome**")
+                    if _bpat["conviction_scatter"]:
+                        _scatter_df = pd.DataFrame(_bpat["conviction_scatter"])
+                        _fig_conv = px.scatter(
+                            _scatter_df,
+                            x="conviction",
+                            y="return_pct",
+                            color="is_win",
+                            color_discrete_map={True: "#1a7a1a", False: "#7a1a1a"},
+                            hover_data=["ticker"],
+                            labels={"conviction": "Conviction (1-5)", "return_pct": "Return %", "is_win": "Win"},
+                        )
+                        _fig_conv.add_hline(y=0, line_dash="dot", line_color="gray")
+                        _fig_conv.update_layout(
+                            paper_bgcolor="#0e1117",
+                            plot_bgcolor="#1a1f2e",
+                            font_color="#fafafa",
+                            margin=dict(l=10, r=10, t=10, b=10),
+                            showlegend=False,
+                            height=280,
+                        )
+                        st.plotly_chart(_fig_conv, use_container_width=True)
+                    else:
+                        st.caption(
+                            "Rate your conviction (1-5) when saving trades. "
+                            "After closing a few, you'll see if conviction predicts wins."
+                        )
+
+                # Exit reason pie chart
+                with _bp_c2:
+                    st.markdown("**Exit Reasons**")
+                    if _bpat["exit_reasons"]:
+                        _fig_pie = px.pie(
+                            names=list(_bpat["exit_reasons"].keys()),
+                            values=list(_bpat["exit_reasons"].values()),
+                            color_discrete_sequence=["#4a9eff", "#ff9944", "#1a7a1a", "#7a1a1a"],
+                        )
+                        _fig_pie.update_layout(
+                            paper_bgcolor="#0e1117",
+                            font_color="#fafafa",
+                            margin=dict(l=10, r=10, t=10, b=10),
+                            height=280,
+                        )
+                        st.plotly_chart(_fig_pie, use_container_width=True)
+                    else:
+                        st.caption("Exit reasons appear after closing trades with the Close button.")
+
+                # Hold duration by exit reason
+                if _bpat["hold_by_reason"]:
+                    st.markdown("**Avg Hold Duration by Exit Reason**")
+                    _hold_df = pd.DataFrame([
+                        {"Reason": k, "Avg Days": v} for k, v in _bpat["hold_by_reason"].items()
+                    ])
+                    st.dataframe(_hold_df, use_container_width=True, hide_index=True)
+
+                # Day-of-week patterns
+                if _bpat["day_of_week"]:
+                    st.markdown("**Return by Day of Week (trade open date)**")
+                    _day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+                    _day_data = []
+                    for d in _day_order:
+                        if d in _bpat["day_of_week"]:
+                            _day_data.append({"Day": d, "Avg Return %": _bpat["day_of_week"][d]})
+                    if _day_data:
+                        _fig_day = px.bar(
+                            pd.DataFrame(_day_data),
+                            x="Day",
+                            y="Avg Return %",
+                            color="Avg Return %",
+                            color_continuous_scale=["#7a1a1a", "#444444", "#1a7a1a"],
+                            color_continuous_midpoint=0,
+                        )
+                        _fig_day.update_layout(
+                            paper_bgcolor="#0e1117",
+                            plot_bgcolor="#1a1f2e",
+                            font_color="#fafafa",
+                            margin=dict(l=10, r=10, t=10, b=10),
+                            showlegend=False,
+                            coloraxis_showscale=False,
+                            height=250,
+                        )
+                        st.plotly_chart(_fig_day, use_container_width=True)
+
+        # ── Signal Strength Sparklines (collapsed by default) ────────────────
+        with st.expander("Signal Strength Sparklines", expanded=False):
+            _sparks = compute_sparklines(_edge_closed)
+            if not _sparks:
+                st.caption("Need 3+ closed trades per signal to show trends.")
+            else:
+                for _src, _returns in _sparks.items():
+                    _sp_c1, _sp_c2 = st.columns([1, 4])
+                    with _sp_c1:
+                        _avg = sum(_returns) / len(_returns)
+                        st.markdown(f"**{_src}**")
+                        st.caption(f"{len(_returns)} trades, avg {_avg:+.1f}%")
+                    with _sp_c2:
+                        _fig_spark = go.Figure()
+                        _colors = ["#1a7a1a" if r > 0 else "#7a1a1a" for r in _returns]
+                        if len(_returns) >= 3:
+                            _fig_spark.add_trace(go.Scatter(
+                                y=_returns,
+                                mode="lines+markers",
+                                line=dict(color="#4a9eff", width=1.5),
+                                marker=dict(size=6, color=_colors),
+                            ))
+                        else:
+                            _fig_spark.add_trace(go.Scatter(
+                                y=_returns,
+                                mode="markers",
+                                marker=dict(size=8, color=_colors),
+                            ))
+                        _fig_spark.add_hline(y=0, line_dash="dot", line_color="gray", line_width=0.5)
+                        _fig_spark.update_layout(
+                            paper_bgcolor="#0e1117",
+                            plot_bgcolor="#1a1f2e",
+                            font_color="#fafafa",
+                            margin=dict(l=5, r=5, t=5, b=5),
+                            showlegend=False,
+                            height=80,
+                            xaxis=dict(showticklabels=False, showgrid=False),
+                            yaxis=dict(showticklabels=False, showgrid=False),
+                        )
+                        st.plotly_chart(_fig_spark, use_container_width=True)

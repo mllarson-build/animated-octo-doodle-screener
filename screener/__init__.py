@@ -10,3 +10,4 @@
 #   tickers — full universe ticker list + pre-filter (get_filtered_universe)
 #   trade   — single-ticker trade builder + paper trade log (analyze_trade)
 #   db      — SQLite data layer for trade log (ensure_db, save_trade, load_trades)
+#   analytics — My Edge computations (signal scorecard, trade stats, behavioral patterns)
