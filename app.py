@@ -931,6 +931,24 @@ with tab_trade:
             key="tb_thesis",
         )
 
+        # ── Sector concentration warning ─────────────────────────────────
+        _trade_sector = _tc.get("sector", "")
+        if _trade_sector and not _open_df.empty and "sector" in _open_df.columns:
+            _sector_alloc = _open_df[_open_df["sector"].notna() & (_open_df["sector"] != "")].copy()
+            if not _sector_alloc.empty:
+                _sector_alloc["_value"] = _sector_alloc["actual_entry_n"].fillna(0) * _sector_alloc["shares_n"].fillna(0)
+                _total_value = _sector_alloc["_value"].sum()
+                if _total_value > 0:
+                    _new_value = _tc["current_price"] * _sz["moderate"]["shares"]
+                    _sector_value = _sector_alloc[_sector_alloc["sector"] == _trade_sector]["_value"].sum() + _new_value
+                    _sector_pct = _sector_value / (_total_value + _new_value) * 100
+                    _sector_count = len(_sector_alloc[_sector_alloc["sector"] == _trade_sector])
+                    if _sector_pct > 40:
+                        st.warning(
+                            f"Adding {_sym} would put {_sector_pct:.0f}% of your open portfolio "
+                            f"in **{_trade_sector}**. You already have {_sector_count} position(s) there."
+                        )
+
         if st.button("Save Trade Idea", key="tb_save", disabled=st.session_state.get("_save_pending", False)):
             save_trade_idea(
                 _tc,
