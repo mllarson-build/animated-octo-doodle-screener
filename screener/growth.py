@@ -66,6 +66,7 @@ def fetch_growth_data(tickers: list[str]) -> pd.DataFrame:
     def fetch_one(ticker: str) -> dict:
         null_row = {
             "Ticker": ticker,
+            "Company": None,
             "Sector": None,
             "Industry": None,
             "Price": None,
@@ -115,14 +116,20 @@ def fetch_growth_data(tickers: list[str]) -> pd.DataFrame:
                 else None
             )
 
+            company_name = info.get("longName") or info.get("shortName") or None
             sector = info.get("sector") or None
             industry = info.get("industry") or None
-            if sector or industry:
-                metadata_cache[ticker] = {"sector": sector, "industry": industry}
+            if sector or industry or company_name:
+                metadata_cache[ticker] = {
+                    "sector": sector,
+                    "industry": industry,
+                    "company_name": company_name,
+                }
             elif ticker in metadata_cache:
                 cached = metadata_cache[ticker]
                 sector = cached.get("sector")
                 industry = cached.get("industry")
+                company_name = company_name or cached.get("company_name")
 
             score = sum([
                 rev_growth is not None and rev_growth > 15,
@@ -134,6 +141,7 @@ def fetch_growth_data(tickers: list[str]) -> pd.DataFrame:
 
             return {
                 "Ticker": ticker,
+                "Company": company_name or ticker,
                 "Sector": sector,
                 "Industry": industry,
                 "Price": round(current_price, 2),

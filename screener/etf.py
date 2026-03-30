@@ -11,6 +11,20 @@ from screener.utils import (
 
 ETF_LIST = ["SPY", "QQQ", "IWM", "XLF", "XLK", "XLE", "XLV", "XBI", "GLD", "TLT", "HYG"]
 
+ETF_NAMES = {
+    "SPY": "SPDR S&P 500 ETF",
+    "QQQ": "Invesco QQQ Trust",
+    "IWM": "iShares Russell 2000",
+    "XLF": "Financial Select SPDR",
+    "XLK": "Technology Select SPDR",
+    "XLE": "Energy Select SPDR",
+    "XLV": "Health Care Select SPDR",
+    "XBI": "SPDR S&P Biotech",
+    "GLD": "SPDR Gold Shares",
+    "TLT": "iShares 20+ Yr Treasury",
+    "HYG": "iShares High Yield Corp Bond",
+}
+
 
 def _pct_change(series: pd.Series, periods: int) -> float | None:
     if len(series) < periods + 1:
@@ -48,6 +62,7 @@ def fetch_etf_data() -> dict:
         if hist is None or hist.empty:
             rows.append({
                 "ETF": ticker,
+                "Company": ETF_NAMES.get(ticker, ticker),
                 "Price": None,
                 "1D %": None,
                 "1W %": None,
@@ -77,6 +92,7 @@ def fetch_etf_data() -> dict:
 
             rows.append({
                 "ETF": ticker,
+                "Company": ETF_NAMES.get(ticker, ticker),
                 "Price": round(current_price, 2),
                 "1D %": round(ret_1d, 2) if ret_1d is not None else None,
                 "1W %": round(ret_1w, 2) if ret_1w is not None else None,
@@ -87,6 +103,7 @@ def fetch_etf_data() -> dict:
         except Exception:
             rows.append({
                 "ETF": ticker,
+                "Company": ETF_NAMES.get(ticker, ticker),
                 "Price": None,
                 "1D %": None,
                 "1W %": None,

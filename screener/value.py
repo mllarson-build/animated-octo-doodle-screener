@@ -17,6 +17,45 @@ def _safe_get(info: dict, key: str):
     return val if val not in (None, "N/A", "Infinity", float("inf")) else None
 
 
+def _compute_peg(info: dict, trailing_pe, forward_pe, earn_growth_pct) -> tuple:
+    """
+    Multi-source PEG ratio calculation.
+    Returns (peg_value, peg_source) where peg_source is one of
+    "Reported", "Calculated", "Estimated", or None.
+    """
+    # Source 1: yfinance direct
+    for key in ("trailingPegRatio", "pegRatio"):
+        val = _safe_get(info, key)
+        if val is not None and isinstance(val, (int, float)) and val > 0:
+            return round(float(val), 2), "Reported"
+
+    # Source 2: Calculate from trailing P/E and earnings growth
+    if (
+        trailing_pe is not None
+        and earn_growth_pct is not None
+        and earn_growth_pct > 0
+    ):
+        peg = trailing_pe / earn_growth_pct
+        return round(peg, 2), "Calculated"
+
+    # Source 3: Forward PEG estimate
+    if forward_pe is not None:
+        # Try earningsGrowth (decimal, e.g. 0.15 = 15%)
+        eg = _safe_get(info, "earningsGrowth")
+        if eg is not None and isinstance(eg, (int, float)) and eg > 0:
+            growth_pct = float(eg) * 100
+            peg = forward_pe / growth_pct
+            return round(peg, 2), "Estimated"
+        # Fallback to revenueGrowth as proxy
+        rg = _safe_get(info, "revenueGrowth")
+        if rg is not None and isinstance(rg, (int, float)) and rg > 0:
+            growth_pct = float(rg) * 100
+            peg = forward_pe / growth_pct
+            return round(peg, 2), "Estimated"
+
+    return None, None
+
+
 @st.cache_data(ttl=4 * 3600)
 def fetch_value_data(tickers: list[str]) -> pd.DataFrame:
     metadata_cache = load_metadata_cache()
@@ -24,6 +63,7 @@ def fetch_value_data(tickers: list[str]) -> pd.DataFrame:
     def fetch_one(ticker: str) -> dict:
         null_row = {
             "Ticker": ticker,
+            "Company": None,
             "Sector": None,
             "Industry": None,
             "Price": None,
@@ -36,6 +76,7 @@ def fetch_value_data(tickers: list[str]) -> pd.DataFrame:
             "Forward P/E": None,
             "P/B": None,
             "PEG": None,
+            "PEG Source": None,
             "Div Yield %": None,
             "D/E": None,
             "Avg Vol (30d)": None,
@@ -76,19 +117,36 @@ def fetch_value_data(tickers: list[str]) -> pd.DataFrame:
             trailing_pe = _safe_get(info, "trailingPE")
             forward_pe = _safe_get(info, "forwardPE")
             pb = _safe_get(info, "priceToBook")
-            peg = _safe_get(info, "pegRatio")
             div_yield_raw = _safe_get(info, "dividendYield")
             div_yield = float(div_yield_raw) * 100 if div_yield_raw is not None else None
             debt_equity = _safe_get(info, "debtToEquity")
 
+            # Earnings growth for PEG calculation
+            earn_growth_raw = _safe_get(info, "earningsGrowth")
+            earn_growth_pct = (
+                float(earn_growth_raw) * 100
+                if earn_growth_raw is not None and isinstance(earn_growth_raw, (int, float))
+                else None
+            )
+
+            peg, peg_source = _compute_peg(info, trailing_pe, forward_pe, earn_growth_pct)
+
+            # Company name
+            company_name = info.get("longName") or info.get("shortName") or None
+
             sector = info.get("sector") or None
             industry = info.get("industry") or None
-            if sector or industry:
-                metadata_cache[ticker] = {"sector": sector, "industry": industry}
+            if sector or industry or company_name:
+                metadata_cache[ticker] = {
+                    "sector": sector,
+                    "industry": industry,
+                    "company_name": company_name,
+                }
             elif ticker in metadata_cache:
                 cached = metadata_cache[ticker]
                 sector = cached.get("sector")
                 industry = cached.get("industry")
+                company_name = company_name or cached.get("company_name")
 
             score = sum([
                 abs(drawdown) > 20,
@@ -102,6 +160,7 @@ def fetch_value_data(tickers: list[str]) -> pd.DataFrame:
 
             return {
                 "Ticker": ticker,
+                "Company": company_name or ticker,
                 "Sector": sector,
                 "Industry": industry,
                 "Price": round(current_price, 2),
@@ -113,7 +172,8 @@ def fetch_value_data(tickers: list[str]) -> pd.DataFrame:
                 "Trailing P/E": round(trailing_pe, 2) if trailing_pe is not None else None,
                 "Forward P/E": round(forward_pe, 2) if forward_pe is not None else None,
                 "P/B": round(pb, 2) if pb is not None else None,
-                "PEG": round(peg, 2) if peg is not None else None,
+                "PEG": peg,
+                "PEG Source": peg_source,
                 "Div Yield %": round(div_yield, 2) if div_yield is not None else None,
                 "D/E": round(float(debt_equity), 2) if debt_equity is not None else None,
                 "Avg Vol (30d)": avg_vol_30,

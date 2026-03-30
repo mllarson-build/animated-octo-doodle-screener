@@ -10,7 +10,7 @@ from screener.growth import fetch_growth_data
 from screener.options import fetch_options_data
 from screener.etf import fetch_etf_data
 from screener.tickers import get_filtered_universe
-from screener.utils import fmt_volume
+from screener.utils import fmt_volume, refresh_ticker_universe, get_universe_info
 from screener.trade import analyze_trade, save_trade_idea, load_trade_log, save_trade_log, compute_paper_stats
 from screener.db import ensure_db
 from screener.backtest import (
@@ -73,6 +73,17 @@ def color_return(val):
     if val < 0:
         return "background-color: #7a1a1a; color: white"
     return ""
+
+
+def color_peg(val):
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return "background-color: #7a1a1a; color: white"
+    if val < 1.0:
+        return "background-color: #1a7a1a; color: white"
+    elif val <= 2.0:
+        return "background-color: #7a7a00; color: white"
+    else:
+        return "background-color: #7a1a1a; color: white"
 
 
 def add_volume_display_cols(df: pd.DataFrame, price_col: str, vol_col: str) -> pd.DataFrame:
@@ -190,11 +201,29 @@ with st.sidebar:
     if "last_refreshed" in st.session_state:
         st.caption(f"Last refreshed: {st.session_state['last_refreshed']}")
 
+    # ── Ticker Universe Management ───────────────────────────────────────────
+    st.divider()
+    st.markdown("**Ticker Universe**")
+    _uni_count, _uni_ts = get_universe_info()
+    if _uni_count > 0:
+        st.caption(f"{_uni_count:,} tickers | Updated: {_uni_ts or 'unknown'}")
+    else:
+        st.caption("No universe saved yet. Click below to fetch.")
+
+    if st.button("Refresh Ticker Universe", use_container_width=True, help="Fetch S&P 500 + Russell 1000/3000 tickers"):
+        with st.spinner("Fetching S&P 500 + Russell 1000/3000…"):
+            _count, _desc = refresh_ticker_universe()
+        if _count > 0:
+            st.success(f"Universe refreshed: {_desc}")
+        else:
+            st.error(f"Universe refresh failed: {_desc}")
+
 # ---------------------------------------------------------------------------
 # Column configs
 # ---------------------------------------------------------------------------
 VALUE_COLUMN_CONFIG = {
     "Ticker": st.column_config.TextColumn("Ticker"),
+    "Company": st.column_config.TextColumn("Company Name"),
     "Sector": st.column_config.TextColumn("Sector"),
     "Industry": st.column_config.TextColumn("Industry"),
     "Price": st.column_config.NumberColumn(
@@ -244,8 +273,12 @@ VALUE_COLUMN_CONFIG = {
     ),
     "PEG": st.column_config.NumberColumn(
         "PEG Ratio",
-        help="P/E divided by earnings growth rate. Below 1 considered undervalued",
+        help="PEG Ratio = P/E divided by earnings growth rate. Below 1.0 may indicate undervalued relative to growth. Source indicates whether this was reported by analysts, calculated from components, or estimated.",
         format="%.2f",
+    ),
+    "PEG Source": st.column_config.TextColumn(
+        "PEG Source",
+        help="How the PEG ratio was obtained: Reported (from analysts), Calculated (trailing P/E / earnings growth), or Estimated (forward P/E / growth estimate)",
     ),
     "Div Yield %": st.column_config.NumberColumn(
         "Div Yield %",
@@ -279,6 +312,7 @@ VALUE_COLUMN_CONFIG = {
 
 GROWTH_COLUMN_CONFIG = {
     "Ticker": st.column_config.TextColumn("Ticker"),
+    "Company": st.column_config.TextColumn("Company Name"),
     "Sector": st.column_config.TextColumn("Sector"),
     "Industry": st.column_config.TextColumn("Industry"),
     "Price": st.column_config.NumberColumn(
@@ -361,6 +395,7 @@ OPTIONS_COLUMN_CONFIG = {
 
 ETF_COLUMN_CONFIG = {
     "ETF": st.column_config.TextColumn("ETF"),
+    "Company": st.column_config.TextColumn("Fund Name"),
     "Price": st.column_config.NumberColumn(
         "Price",
         help="Current market price",
@@ -434,6 +469,7 @@ with tab_value:
             display_df.style
             .applymap(color_score_value, subset=["recovery_score"])
             .applymap(color_vol_ratio, subset=["Vol Ratio"])
+            .applymap(color_peg, subset=["PEG"])
         )
         st.dataframe(
             styled,
@@ -758,13 +794,20 @@ with tab_trade:
     _tb_analyze = st.button("Analyze Trade", type="primary", key="tb_analyze")
 
     if _tb_analyze:
-        with st.spinner(f"Analyzing {_tb_ticker}…"):
+        if not _tb_ticker:
+            st.error("Please enter a ticker symbol to analyze.")
+        else:
+            st.info(f"Analyzing **{_tb_ticker}**…")
             try:
                 _tc = analyze_trade(_tb_ticker)
-                st.session_state["trade_card"] = _tc
-                st.session_state["trade_ticker"] = _tb_ticker
+                if _tc is None:
+                    st.error(f"analyze_trade returned None for {_tb_ticker}. No data available.")
+                    st.session_state.pop("trade_card", None)
+                else:
+                    st.session_state["trade_card"] = _tc
+                    st.session_state["trade_ticker"] = _tb_ticker
             except Exception as _e:
-                st.error(f"Could not analyze {_tb_ticker}: {_e}")
+                st.error(f"Could not analyze {_tb_ticker}: {type(_e).__name__}: {_e}")
                 st.session_state.pop("trade_card", None)
 
     if "trade_card" not in st.session_state:

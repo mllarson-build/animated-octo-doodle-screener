@@ -306,8 +306,177 @@ def fmt_volume(val) -> str:
     return f"{int(val)}"
 
 
+# ---------------------------------------------------------------------------
+# Ticker universe — S&P 500 + Russell 1000/3000
+# ---------------------------------------------------------------------------
+
+TICKER_CACHE_PATH_MAIN = "data/tickers.csv"
+UNIVERSE_TIMESTAMP_PATH = "data/universe_updated.txt"
+
+SP500_WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+IWB_HOLDINGS_URL = (
+    "https://www.ishares.com/us/products/239707/ishares-russell-1000-etf/"
+    "1467271812596.ajax?fileType=csv&fileName=IWB_holdings&dataType=fund"
+)
+IWV_HOLDINGS_URL = (
+    "https://www.ishares.com/us/products/239714/ishares-russell-3000-etf/"
+    "1467271812596.ajax?fileType=csv&fileName=IWV_holdings&dataType=fund"
+)
+
+
+def _fetch_sp500_tickers() -> pd.DataFrame:
+    """Fetch S&P 500 constituents from Wikipedia. Returns DataFrame with Ticker, Company, Sector, Industry."""
+    try:
+        tables = pd.read_html(SP500_WIKI_URL)
+        df = tables[0]
+        col_map = {}
+        for c in df.columns:
+            cl = c.lower()
+            if "symbol" in cl:
+                col_map["Ticker"] = c
+            elif "security" in cl or "company" in cl:
+                col_map["company_name"] = c
+            elif "sector" in cl and "sub" not in cl:
+                col_map["sector"] = c
+            elif "sub" in cl and "industr" in cl:
+                col_map["industry"] = c
+        if "Ticker" not in col_map:
+            return pd.DataFrame()
+        out = df.rename(columns={v: k for k, v in col_map.items()})
+        out = out[list(col_map.keys())].copy()
+        # Clean tickers (some Wikipedia entries have dots like BRK.B → BRK-B)
+        out["Ticker"] = out["Ticker"].str.replace(".", "-", regex=False).str.strip()
+        return out
+    except Exception:
+        return pd.DataFrame()
+
+
+def _fetch_ishares_holdings(url: str) -> list[str]:
+    """Fetch ticker list from an iShares ETF holdings CSV."""
+    try:
+        r = requests.get(
+            url,
+            timeout=30,
+            headers={"User-Agent": random_user_agent()},
+        )
+        r.raise_for_status()
+        from io import StringIO
+        text = r.text
+        # iShares CSVs have header rows before the actual data
+        # Find the row that starts the table (contains "Ticker")
+        lines = text.split("\n")
+        start = 0
+        for i, line in enumerate(lines):
+            if "Ticker" in line or "ticker" in line.lower():
+                start = i
+                break
+        csv_text = "\n".join(lines[start:])
+        df = pd.read_csv(StringIO(csv_text))
+        # Find the ticker column
+        ticker_col = None
+        for c in df.columns:
+            if c.strip().lower() == "ticker":
+                ticker_col = c
+                break
+        if ticker_col is None:
+            return []
+        tickers = df[ticker_col].dropna().astype(str).str.strip().tolist()
+        # Filter to clean ticker symbols
+        import re
+        tickers = [t for t in tickers if re.match(r"^[A-Z]{1,5}$", t)]
+        return tickers
+    except Exception:
+        return []
+
+
+def refresh_ticker_universe() -> tuple[int, str]:
+    """
+    Fetch tickers from S&P 500 (Wikipedia), Russell 1000 (IWB), and Russell 3000 (IWV).
+    Merges, deduplicates, pre-filters (no dots/slashes, price > $1), saves to
+    data/tickers.csv and data/ticker_metadata.csv.
+    Returns (ticker_count, source_description).
+    """
+    import re
+
+    all_tickers = set()
+    metadata = load_metadata_cache()
+    sources_used = []
+
+    # Source 1: S&P 500 from Wikipedia
+    sp500 = _fetch_sp500_tickers()
+    if not sp500.empty:
+        sources_used.append(f"S&P 500 ({len(sp500)})")
+        for _, row in sp500.iterrows():
+            t = row.get("Ticker", "")
+            if t and re.match(r"^[A-Z]{1,5}$", t):
+                all_tickers.add(t)
+                if t not in metadata or not metadata[t].get("sector"):
+                    metadata[t] = {
+                        "sector": row.get("sector") or None,
+                        "industry": row.get("industry") or None,
+                        "company_name": row.get("company_name") or None,
+                    }
+
+    # Source 2: Russell 1000 (IWB)
+    iwb = _fetch_ishares_holdings(IWB_HOLDINGS_URL)
+    if iwb:
+        new_from_iwb = len(set(iwb) - all_tickers)
+        sources_used.append(f"Russell 1000 (+{new_from_iwb})")
+        all_tickers.update(iwb)
+
+    # Source 3: Russell 3000 (IWV)
+    iwv = _fetch_ishares_holdings(IWV_HOLDINGS_URL)
+    if iwv:
+        new_from_iwv = len(set(iwv) - all_tickers)
+        sources_used.append(f"Russell 3000 (+{new_from_iwv})")
+        all_tickers.update(iwv)
+
+    if not all_tickers:
+        return 0, "All sources failed"
+
+    # Pre-filter: exclude tickers with . or / (warrants, preferred shares)
+    filtered = [t for t in all_tickers if "." not in t and "/" not in t]
+    # Keep only clean 1-5 letter tickers
+    filtered = [t for t in filtered if re.match(r"^[A-Z]{1,5}$", t)]
+    filtered.sort()
+
+    # Save tickers.csv
+    os.makedirs("data", exist_ok=True)
+    pd.DataFrame({"Ticker": filtered}).to_csv(TICKER_CACHE_PATH_MAIN, index=False)
+
+    # Save metadata cache
+    save_metadata_cache(metadata)
+
+    # Save timestamp
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(UNIVERSE_TIMESTAMP_PATH, "w") as f:
+        f.write(ts)
+
+    source_desc = " + ".join(sources_used) if sources_used else "unknown"
+    return len(filtered), f"{source_desc} — {len(filtered)} tickers total"
+
+
+def get_universe_info() -> tuple[int, str | None]:
+    """Return (ticker_count, last_updated_timestamp) from the saved universe, or (0, None)."""
+    count = 0
+    ts = None
+    if os.path.exists(TICKER_CACHE_PATH_MAIN):
+        try:
+            df = pd.read_csv(TICKER_CACHE_PATH_MAIN)
+            count = len(df)
+        except Exception:
+            pass
+    if os.path.exists(UNIVERSE_TIMESTAMP_PATH):
+        try:
+            with open(UNIVERSE_TIMESTAMP_PATH) as f:
+                ts = f.read().strip()
+        except Exception:
+            pass
+    return count, ts
+
+
 def load_metadata_cache() -> dict:
-    """Load sector/industry cache from disk. Returns {ticker: {sector, industry}}."""
+    """Load sector/industry/company_name cache from disk. Returns {ticker: {sector, industry, company_name}}."""
     if os.path.exists(METADATA_CACHE_PATH):
         try:
             df = pd.read_csv(METADATA_CACHE_PATH, dtype=str).fillna("")
@@ -316,6 +485,7 @@ def load_metadata_cache() -> dict:
                 result[row["Ticker"]] = {
                     "sector": row.get("sector", "") or None,
                     "industry": row.get("industry", "") or None,
+                    "company_name": row.get("company_name", "") or None,
                 }
             return result
         except Exception:
@@ -324,7 +494,7 @@ def load_metadata_cache() -> dict:
 
 
 def save_metadata_cache(cache: dict) -> None:
-    """Save sector/industry cache to disk."""
+    """Save sector/industry/company_name cache to disk."""
     try:
         os.makedirs("data", exist_ok=True)
         rows = [
@@ -332,6 +502,7 @@ def save_metadata_cache(cache: dict) -> None:
                 "Ticker": t,
                 "sector": v.get("sector") or "",
                 "industry": v.get("industry") or "",
+                "company_name": v.get("company_name") or "",
             }
             for t, v in cache.items()
         ]
